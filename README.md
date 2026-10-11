@@ -23,8 +23,9 @@ Candidates:
   site allows 10 requests a day per IP; a run makes one at most, we cap ourselves at 3 a day,
   and the last good snapshot stands in when a request fails (`--no-btcnodes` uses it outright).
 - **addrv2 gossip**: one `getaddr` per peer per run, after `sendaddrv2` in the handshake.
-  BIP155 TorV3 entries with bit 6 become candidates; clearnet x49 entries are dialled for their
-  own gossip, up to 100 a run.
+  BIP155 TorV3 entries with bit 6, seen in the last 3 days, become candidates, at most 500 a
+  run: most gossiped onions are dead, and each dead one costs Tor several descriptor lookups.
+  Clearnet x49 entries are dialled for their own gossip, up to 100 a run.
 - **Our own node** (signet): `getnodeaddresses 0 onion`, entries with bit 6.
 - **Earlier runs**: peers that answered in the last 7 runs are checked again, so every peer has
   a daily record.
@@ -44,7 +45,9 @@ Each peer's record has the connect, handshake and cfheaders latencies; the summa
 spread over the peers that passed, and failures by kind.
 
 Politeness: 32 connections at most, new Tor streams paced at 2 a second (`--stream-rate`),
-RESOLVE 4 at a time, timeouts on every step, one `getaddr` per peer.
+RESOLVE 4 at a time, timeouts on every step, one `getaddr` per peer. SIGTERM stops a run early
+and still writes its file; a run whose first 64 onion peers all fail to connect (Tor not
+building circuits) writes none.
 
 ## The list
 
@@ -86,7 +89,9 @@ scripts/kyoto-check.sh mainnet mainnet.json keys/test-key.pub.json   # 10 Kyoto 
 `kyoto-check` uses bip157 at the commit the plan pins (0.7.0 was published from it, untagged):
 `whitelist_only`, 8 random listed peers, Tor's IsolateDestAddr port, a 30 s handshake timeout,
 `required_peers` 3 on mainnet and 2 on signet, from a checkpoint 144 blocks below the tip. A
-start counts when Kyoto reports `FiltersSynced` at or above the tip we saw before it began.
+start counts when Kyoto reports `FiltersSynced` at or above the tip we saw before it began, with
+the same block hash where its last ten headers overlap ours. Kyoto's response timeout stays at
+its 5 s default; `BPL_KYOTO_RESPONSE_TIMEOUT=15` raises it, for diagnosis only.
 
 ### The daily timer (not installed)
 

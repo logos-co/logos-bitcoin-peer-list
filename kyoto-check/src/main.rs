@@ -66,6 +66,8 @@ struct Report {
     expect_tip: u32,
     required_peers: u8,
     handshake_timeout_s: u64,
+    /// Kyoto's default (5 s) unless set.
+    response_timeout_s: Option<u64>,
     starts: Vec<Start>,
     reached: usize,
     seconds_p50: Option<f64>,
@@ -85,10 +87,11 @@ struct Setup {
     required: u8,
     expect: (u32, Option<BlockHash>),
     limit: Duration,
+    response: Option<Duration>,
 }
 
 async fn one(n: usize, peers: &[String], c: &Setup) -> Start {
-    let Setup { network, socks, cp, required, expect, limit } = *c;
+    let Setup { network, socks, cp, required, expect, limit, response } = *c;
     let mut s = Start { n, peers: peers.to_vec(), ..Start::default() };
     let x49 = ServiceFlags::NETWORK | ServiceFlags::WITNESS | ServiceFlags::COMPACT_FILTERS;
     let trusted: Vec<TrustedPeer> = peers
@@ -98,14 +101,17 @@ async fn one(n: usize, peers: &[String], c: &Setup) -> Start {
             Some(TrustedPeer::new(AddrV2::TorV3(onion_key(host)?), port.parse().ok(), x49))
         })
         .collect();
-    let (node, client) = Builder::new(network)
+    let mut builder = Builder::new(network)
         .add_peers(trusted)
         .whitelist_only()
         .required_peers(required)
         .socks5_proxy(socks)
         .handshake_timeout(Duration::from_secs(30))
-        .chain_state(ChainState::Checkpoint(cp))
-        .build();
+        .chain_state(ChainState::Checkpoint(cp));
+    if let Some(r) = response {
+        builder = builder.response_timeout(r);
+    }
+    let (node, client) = builder.build();
     let Client { requester, mut info_rx, mut warn_rx, mut event_rx } = client;
     let t = Instant::now();
     let mut node = tokio::spawn(node.run());
@@ -150,7 +156,7 @@ async fn one(n: usize, peers: &[String], c: &Setup) -> Start {
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let need = |k: &str| arg(&args, k).unwrap_or_else(|| {
-        eprintln!("usage: kyoto-check --list FILE --network mainnet|signet --checkpoint HEIGHT:HASH --expect-tip HEIGHT[:HASH] [--socks 127.0.0.1:29051] [--starts 10] [--peers 8] [--timeout 900] [--out FILE]");
+        eprintln!("usage: kyoto-check --list FILE --network mainnet|signet --checkpoint HEIGHT:HASH --expect-tip HEIGHT[:HASH] [--socks 127.0.0.1:29051] [--starts 10] [--peers 8] [--timeout 900] [--response-timeout S] [--out FILE]");
         std::process::exit(2)
     });
     let list_path = need("--list");
@@ -175,13 +181,14 @@ async fn main() {
     let starts: usize = arg(&args, "--starts").map(|v| v.parse().expect("--starts")).unwrap_or(10);
     let pick: usize = arg(&args, "--peers").map(|v| v.parse().expect("--peers")).unwrap_or(8);
     let limit = Duration::from_secs(arg(&args, "--timeout").map(|v| v.parse().expect("--timeout")).unwrap_or(900));
+    let response = arg(&args, "--response-timeout").map(|v| Duration::from_secs(v.parse().expect("--response-timeout")));
 
     let list: serde_json::Value = serde_json::from_slice(&std::fs::read(&list_path).expect("read --list")).expect("list JSON");
     assert_eq!(list["network"].as_str(), Some(net_name.as_str()), "the list is for another network");
     let all: Vec<String> = list["peers"].as_array().expect("peers").iter().filter_map(|p| p.as_str().map(String::from)).collect();
     eprintln!("{net_name}: {} listed peers; {starts} starts of {pick} random peers, required_peers {required}", all.len());
 
-    let setup = Setup { network, socks, cp, required, expect, limit };
+    let setup = Setup { network, socks, cp, required, expect, limit, response };
     let mut out = vec![];
     for n in 1..=starts {
         let mut chosen = all.clone();
@@ -202,6 +209,7 @@ async fn main() {
         expect_tip: expect.0,
         required_peers: required,
         handshake_timeout_s: 30,
+        response_timeout_s: response.map(|r| r.as_secs()),
         reached: out.iter().filter(|s| s.ok).count(),
         seconds_p50: pct(50),
         seconds_p90: pct(90),

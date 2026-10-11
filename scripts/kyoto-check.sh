@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Kyoto against a signed list: N starts of 8 random peers through Tor's IsolateDestAddr port,
-# from a checkpoint BPL_KYOTO_BACK blocks (default 144) below the tip.
+# from a checkpoint BPL_KYOTO_BACK blocks (default 144) below the tip. BPL_KYOTO_RESPONSE_TIMEOUT
+# (seconds) overrides Kyoto's 5 s response timeout, for diagnosis only: the plan keeps the default.
 # Usage: kyoto-check.sh mainnet|signet LIST.json PUBKEY.json [starts, default 10]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -29,4 +30,5 @@ mkdir -p "$BPL_HOME/kyoto"
 out="$BPL_HOME/kyoto/$net-$(date -u +%Y%m%dT%H%M%SZ).json"
 echo "$(utc_now) $net: checkpoint $cp, tip $tip; report $out"
 "$BIN_DIR/kyoto-check" --list "$list" --network "$net" --socks "$BPL_SOCKS_ISO" \
-    --checkpoint "$cp:$cphash" --expect-tip "$tip:$tiphash" --starts "$starts" --out "$out"
+    --checkpoint "$cp:$cphash" --expect-tip "$tip:$tiphash" --starts "$starts" --out "$out" \
+    ${BPL_KYOTO_RESPONSE_TIMEOUT:+--response-timeout "$BPL_KYOTO_RESPONSE_TIMEOUT"}
