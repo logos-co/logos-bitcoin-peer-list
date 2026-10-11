@@ -1,0 +1,16 @@
+# One daily crawl (scripts/daily-run.sh). A user unit; see the README before installing it.
+[Unit]
+Description=Logos Bitcoin peer list: daily crawl of onion peers over Tor
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=BPL_HOME=%h/btc-peer-list
+Environment=PATH=%h/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/env bash %h/btc-peer-list/src/scripts/daily-run.sh
+# The script stops Tor and bitcoind itself; anything left in the unit's cgroup goes with it.
+KillMode=control-group
+TimeoutStartSec=6h
+Nice=10
+IOSchedulingClass=idle
