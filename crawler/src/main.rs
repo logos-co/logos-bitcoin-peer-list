@@ -26,7 +26,7 @@ const USAGE: &str = "usage:
                     [--budget N] [--no-btcnodes] [--rpc-port N --rpc-cookie FILE] [--seed-queries N]
                     [--range N] [--depth N] [--connect-timeout S] [--handshake-timeout S]
                     [--cfheaders-timeout S] [--getaddr-window S] [--previous N] [--gossip-clearnet N]
-                    [--stream-rate PER_SECOND]
+                    [--gossip-onion N] [--gossip-max-age-days N] [--stream-rate PER_SECOND]
   peer-list list    --network NET --key SECRET [--home DIR] [--last 7] [--min-pass 6]
                     [--version N] [--note TEXT] [--out FILE]
   peer-list verify  --pubkey FILE LIST...
@@ -105,6 +105,8 @@ async fn crawl(a: &Args) -> Result<(), String> {
         seed_queries: a.num("seed-queries", 6)?,
         previous: a.num("previous", 7)?,
         gossip_clearnet: a.num("gossip-clearnet", 100)?,
+        gossip_onion: a.num("gossip-onion", 500)?,
+        gossip_max_age: Duration::from_secs(a.num("gossip-max-age-days", 3u64)? * 86_400),
     };
     let (path, run) = crawl::run(o).await?;
     println!("{}", path.display());

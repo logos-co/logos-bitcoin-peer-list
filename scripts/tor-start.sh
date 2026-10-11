@@ -19,16 +19,27 @@ SocksPort $BPL_SOCKS IsolateSOCKSAuth ExtendedErrors
 SocksPort $BPL_SOCKS_ISO IsolateDestAddr ExtendedErrors
 EOF
 
-: > "$TOR_DIR/tor.log"
-rm -f "$TOR_DIR/tor.pid"
-nix shell "$BPL_NIXPKGS#tor" -c tor -f "$TOR_DIR/torrc" --quiet
+start_and_wait() {
+    : > "$TOR_DIR/tor.log"
+    rm -f "$TOR_DIR/tor.pid"
+    nix shell "$BPL_NIXPKGS#tor" -c tor -f "$TOR_DIR/torrc" --quiet
+    for _ in $(seq 1 300); do
+        if grep -q "Bootstrapped 100%" "$TOR_DIR/tor.log"; then
+            echo "tor bootstrapped, pid $(cat "$TOR_DIR/tor.pid")"
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
 
-for _ in $(seq 1 300); do
-    if grep -q "Bootstrapped 100%" "$TOR_DIR/tor.log"; then
-        echo "tor bootstrapped, pid $(cat "$TOR_DIR/tor.pid")"
-        exit 0
-    fi
-    sleep 1
-done
-echo "tor did not bootstrap within 300 s; see $TOR_DIR/tor.log" >&2
+start_and_wait && exit 0
+# Guards that stop answering circuit handshakes (seen 2026-10-11) block bootstrap for good:
+# set the state aside once, so Tor picks new guards.
+echo "tor did not bootstrap within 300 s; retrying with fresh guards" >&2
+cp "$TOR_DIR/tor.log" "$TOR_DIR/tor.failed-bootstrap.log"
+bash "$(dirname "$0")/tor-stop.sh" || true
+[ -f "$TOR_DIR/data/state" ] && mv "$TOR_DIR/data/state" "$TOR_DIR/state.stuck-guards.$(date +%s)"
+start_and_wait && exit 0
+echo "tor did not bootstrap with fresh guards either; see $TOR_DIR/tor.log" >&2
 exit 1

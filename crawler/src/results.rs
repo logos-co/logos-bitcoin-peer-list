@@ -151,4 +151,9 @@ pub struct Summary {
     /// Over the peers that passed.
     pub latency_ms: BTreeMap<String, Latency>,
     pub duration_s: u64,
+    /// Stopped by a signal before the queue ran out; `not_checked` were left.
+    #[serde(default)]
+    pub stopped_early: bool,
+    #[serde(default)]
+    pub not_checked: usize,
 }

@@ -46,6 +46,11 @@ pub struct Opts {
     pub previous: usize,
     /// Clearnet x49 peers from gossip, dialled for their own gossip only, at most.
     pub gossip_clearnet: usize,
+    /// Onion candidates learned from gossip this run, at most: most are dead, and each dead
+    /// onion costs Tor several descriptor lookups.
+    pub gossip_onion: usize,
+    /// Gossip entries last seen longer ago than this are ignored.
+    pub gossip_max_age: Duration,
 }
 
 /// What every peer is asked: filter headers for `start..=stop`, and our node's answer if we have one.
@@ -59,6 +64,7 @@ struct Expect {
 struct Ctx {
     socks: SocketAddr,
     network: Network,
+    gossip_min_time: u32,
     connect_timeout: Duration,
     handshake_timeout: Duration,
     cfheaders_timeout: Duration,
@@ -163,7 +169,7 @@ async fn check(ctx: Arc<Ctx>, addr: String, is_onion: bool) -> Checked {
     // One getaddr per peer per run.
     if let Ok(Ok(entries)) = tokio::time::timeout(ctx.getaddr_window + Duration::from_secs(5), c.getaddr(ctx.getaddr_window)).await {
         r.gossip_addresses = Some(entries.len());
-        for e in entries {
+        for e in entries.into_iter().filter(|e| e.time >= ctx.gossip_min_time) {
             let svc = e.services.to_u64();
             match e.addr {
                 AddrV2::TorV3(pk) => {
@@ -451,6 +457,7 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     let ctx = Arc::new(Ctx {
         socks: o.socks,
         network: o.net.network,
+        gossip_min_time: unix_now().saturating_sub(o.gossip_max_age.as_secs()) as u32,
         connect_timeout: o.connect_timeout,
         handshake_timeout: o.handshake_timeout,
         cfheaders_timeout: o.cfheaders_timeout,
@@ -464,6 +471,18 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     let mut queued = 0usize;
     let mut over = 0usize;
     let mut clear_queued = 0usize;
+    let mut gossip_queued = 0usize;
+    // SIGTERM or SIGINT: stop starting checks, finish those running, write the run.
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    for kind in [tokio::signal::unix::SignalKind::terminate(), tokio::signal::unix::SignalKind::interrupt()] {
+        if let Ok(mut sig) = tokio::signal::unix::signal(kind) {
+            let stop = stop.clone();
+            tokio::spawn(async move {
+                sig.recv().await;
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+        }
+    }
     for a in &order {
         if seen.insert(a.clone()) {
             if queued < o.budget {
@@ -479,7 +498,7 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     let mut set = JoinSet::new();
     let mut done = 0usize;
     loop {
-        while set.len() < o.concurrency {
+        while set.len() < o.concurrency && !stop.load(std::sync::atomic::Ordering::SeqCst) {
             let Some((addr, is_onion)) = queue.pop_front() else { break };
             set.spawn(check(ctx.clone(), addr, is_onion));
         }
@@ -499,9 +518,10 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
             let e = sources.entry(a.clone()).or_default();
             e.insert("gossip".into());
             if seen.insert(a.clone()) {
-                if queued < o.budget {
+                if queued < o.budget && gossip_queued < o.gossip_onion {
                     queue.push_back((a, true));
                     queued += 1;
+                    gossip_queued += 1;
                     gs.new_candidates += 1;
                 } else {
                     over += 1;
@@ -516,6 +536,10 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
         }
         if c.onion {
             run.peers.push(c.r);
+            // A Tor that builds no circuits would record a false failure for every peer.
+            if run.peers.len() == 64 && run.peers.iter().all(|p| p.connect_ms.is_none()) {
+                return Err("the first 64 onion peers all failed to connect: Tor is not building circuits; no run file written".into());
+            }
         } else {
             let mut r = c.r;
             let ip: Option<IpAddr> = onion::split_host_port(&r.addr).and_then(|(h, _)| h.parse().ok());
@@ -527,6 +551,8 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
         }
     }
     gs.over_budget = over;
+    run.summary.stopped_early = stop.load(std::sync::atomic::Ordering::SeqCst);
+    run.summary.not_checked = queue.len();
 
     for p in &mut run.peers {
         p.sources = sources.get(&p.addr).map(|s| s.iter().cloned().collect()).unwrap_or_default();

@@ -65,9 +65,15 @@ pub struct Rule {
 
 pub struct Built {
     pub list: PeerList,
-    /// Pass counts of every peer that passed at least once, most passes first.
+    /// Pass counts of every peer that passed at least once, best first.
     pub counts: Vec<(String, usize)>,
     pub runs: Vec<String>,
+}
+
+/// Median of a peer's handshake plus cfheaders time over the runs it passed.
+fn median(mut v: Vec<u64>) -> u64 {
+    v.sort_unstable();
+    v.get(v.len() / 2).copied().unwrap_or(u64::MAX)
 }
 
 pub fn build(runs: &[Run], network: &str, rule: &Rule, version: u64, created: u64, note: &str) -> Result<Built, String> {
@@ -77,17 +83,19 @@ pub fn build(runs: &[Run], network: &str, rule: &Rule, version: u64, created: u6
     if runs.len() < rule.min_pass {
         return Err(format!("{} {network} runs, and the rule needs {} passes", runs.len(), rule.min_pass));
     }
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: BTreeMap<String, Vec<u64>> = BTreeMap::new();
     for r in runs {
         for p in r.peers.iter().filter(|p| p.passed) {
             let onion_v3 = onion::split_host_port(&p.addr).is_some_and(|(h, _)| onion::to_pubkey(h).is_some());
             if onion_v3 {
-                *counts.entry(p.addr.clone()).or_default() += 1;
+                seen.entry(p.addr.clone()).or_default().push(p.handshake_ms.unwrap_or(0) + p.cfheaders_ms.unwrap_or(0));
             }
         }
     }
-    let mut counts: Vec<(String, usize)> = counts.into_iter().collect();
-    counts.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // Most passes first, then the fastest, so a cap keeps the best peers.
+    let mut ranked: Vec<(String, usize, u64)> = seen.into_iter().map(|(a, ms)| (a, ms.len(), median(ms))).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+    let counts: Vec<(String, usize)> = ranked.into_iter().map(|(a, n, _)| (a, n)).collect();
     let mut peers: Vec<String> = counts.iter().filter(|(_, n)| *n >= rule.min_pass).map(|(a, _)| a.clone()).take(MAX_PEERS).collect();
     peers.sort();
     let list = PeerList {
@@ -128,6 +136,15 @@ mod tests {
         runs.push(run("signet", 0, &[&b]));
         let built = build(&runs, "mainnet", &Rule { last: 7, min_pass: 6 }, 3, 1_791_383_742, "n").unwrap();
         assert_eq!(built.list.peers, vec![a.clone()]);
+        // With equal passes the faster peer ranks first.
+        let fast = format!("{}:8333", onion::from_pubkey(&[9; 32]));
+        let mut two = vec![run("mainnet", 1, &[&b]), run("mainnet", 2, &[&b])];
+        for r in two.iter_mut() {
+            r.peers[0].handshake_ms = Some(900);
+            r.peers.push(PeerResult { addr: fast.clone(), passed: true, handshake_ms: Some(100), ..PeerResult::default() });
+        }
+        let ranked = build(&two, "mainnet", &Rule { last: 2, min_pass: 2 }, 1, 0, "").unwrap();
+        assert_eq!(ranked.counts, vec![(fast, 2), (b.clone(), 2)]);
         assert_eq!(built.counts, vec![(a, 7), (b, 5)]);
         assert_eq!((built.list.version.as_str(), built.list.date.as_deref(), built.runs.len()), ("3", Some("2024-10-10"), 7));
         assert!(build(&runs[..3], "mainnet", &Rule { last: 7, min_pass: 6 }, 1, 0, "").is_err());
