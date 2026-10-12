@@ -1,13 +1,14 @@
 # logos-bitcoin-peer-list
 
 Curates the onion peers that the Logos Bitcoin wallet gives Kyoto (bip157, the BIP157/158 light
-client) with `whitelist_only`, so Kyoto never resolves a name. It runs on our build
-infrastructure, never on a user's device, and every connection it makes goes through Tor.
-The output is a signed list per network that `bitcoin_node_module` ships and verifies.
+client) with `whitelist_only`, so Kyoto never resolves a name. It runs at release time on our
+build infrastructure, never on a user's device and never as a service, and every connection it
+makes goes through Tor. The output is a signed list per network that `bitcoin_node_module`
+ships and verifies; it seeds each install's own peer book, which that install keeps fresh.
 
 Spike 5 of the Bitcoin wallet plan: at least 50 mainnet and 10 signet onion peers pass every
 check on 6 of 7 days, the testnet4 count is reported, and Kyoto given 8 random listed peers
-reaches the tip in 10 of 10 starts.
+reaches the tip in 10 of 10 starts. Since 2026-10-12 the list is cut per release, not daily.
 
 ## What a run does
 
@@ -27,8 +28,8 @@ Candidates:
   run: most gossiped onions are dead, and each dead one costs Tor several descriptor lookups.
   Clearnet x49 entries are dialled for their own gossip, up to 100 a run.
 - **Our own node** (signet): `getnodeaddresses 0 onion`, entries with bit 6.
-- **Earlier runs**: peers that answered in the last 7 runs are checked again, so every peer has
-  a daily record.
+- **Earlier runs**: peers that answered in the last 7 runs are checked again, so every peer
+  keeps a record across runs.
 
 Checks, all over Tor, one connection per peer:
 
@@ -82,7 +83,6 @@ RPC 29332).
 scripts/build.sh            # nixpkgs Rust, out of tree in $BPL_HOME/target, -j 8
 scripts/tor-start.sh        # our own Tor (nixpkgs), own DataDirectory, PidFile
 scripts/signet-start.sh     # our signet node through that Tor; scripts/signet-wait.sh
-scripts/daily-run.sh        # one full run, then Tor and bitcoind stopped by PID
 scripts/kyoto-check.sh mainnet mainnet.json keys/test-key.pub.json   # 10 Kyoto starts
 ```
 
@@ -93,21 +93,41 @@ start counts when Kyoto reports `FiltersSynced` at or above the tip we saw befor
 the same block hash where its last ten headers overlap ours. Kyoto's response timeout stays at
 its 5 s default; `BPL_KYOTO_RESPONSE_TIMEOUT=15` raises it, for diagnosis only.
 
-### The daily timer (not installed)
+## Release procedure
 
-`systemd/` holds a user service and timer for one run a day at about 03:30 UTC. Installing
-them is a decision for the machine's owner:
+At release time only, never as a service. `peer-list release` makes one budgeted crawl (the
+per-network `--budget` of checked candidates, the gossip caps, every timeout) and signs the onion
+peers that passed every check in each of the last `--runs` runs (default 1: this one alone;
+more requires earlier runs in `runs/<network>/`). An empty list, too few runs, or a crawl
+stopped early signs nothing. `peer-list seeds` takes Bitcoin Core's onion v3 fixed seeds from a
+Core source tree's `contrib/seeds`, which the node module asks for addresses when an install's
+book runs short.
 
-```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/logos-btc-peer-list.service systemd/logos-btc-peer-list.timer ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now logos-btc-peer-list.timer
-loginctl enable-linger "$USER"   # otherwise user timers run only while a session is open
-```
+1. On the crawl host (framework.lan), after `scripts/build.sh`:
 
-The runs need the repository extracted at `~/btc-peer-list/src` and `scripts/build.sh` run
-once. Signing stays a separate step where the key is.
+   ```bash
+   BPL_KEY=/path/to/release.secret scripts/release.sh   # BPL_RELEASE_RUNS=N to require N runs
+   ```
+
+   It starts our Tor (and the signet node, waiting for its tip), runs `peer-list release` per
+   network into `$BPL_HOME/release/<network>.json`, and stops both by PID.
+2. Optionally, Kyoto against each list: `scripts/kyoto-check.sh mainnet
+   $BPL_HOME/release/mainnet.json KEY.pub.json`, the same for signet, with our Tor up (and our
+   signet node, for signet) and stopped after by their stop scripts.
+3. Where the node module is checked out, with that directory copied over:
+
+   ```bash
+   scripts/install-release.sh ~/repos/logos-bitcoin-node-module RELEASE_DIR
+   ```
+
+   Every list must verify against a key the module compiles in (`rust-lib/keys/`), name its own
+   network and be newer than the one shipped, or nothing is copied. Then the seeds go to
+   `rust-lib/peer-lists/seeds-<network>.json`, from logos-bitcoin-core-nix's `bitcoin-core-src`
+   (`BPL_CORE_SRC` names another tree).
+4. Run the node module's tests and commit the lists and seeds there.
+
+Where the signing key is not on the crawl host: crawl there (`peer-list crawl`), copy
+`runs/<network>/` next to the key, and sign with `peer-list release --no-crawl --home DIR`.
 
 ## Development
 

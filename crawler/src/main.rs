@@ -13,6 +13,7 @@ mod onion;
 mod p2p;
 mod results;
 mod rpc;
+mod seeds;
 mod socks;
 mod util;
 
@@ -27,6 +28,11 @@ const USAGE: &str = "usage:
                     [--range N] [--depth N] [--connect-timeout S] [--handshake-timeout S]
                     [--cfheaders-timeout S] [--getaddr-window S] [--previous N] [--gossip-clearnet N]
                     [--gossip-onion N] [--gossip-max-age-days N] [--stream-rate PER_SECOND]
+  peer-list release --network NET --key SECRET [--runs 1] [--no-crawl] [--out DIR]
+                    [crawl options]   (one budgeted crawl, then a signed list of the peers that
+                    passed every check in each of the last --runs runs: DIR/<network>.json,
+                    DIR defaults to HOME/release)
+  peer-list seeds   --core-src DIR --out DIR   (Core's onion v3 fixed seeds, per network)
   peer-list list    --network NET --key SECRET [--home DIR] [--last 7] [--min-pass 6]
                     [--version N] [--note TEXT] [--out FILE]
   peer-list verify  --pubkey FILE LIST...
@@ -79,6 +85,13 @@ impl Args {
 }
 
 async fn crawl(a: &Args) -> Result<(), String> {
+    let (path, run) = crawl::run(crawl_opts(a)?).await?;
+    println!("{}", path.display());
+    print_summary(&run);
+    Ok(())
+}
+
+fn crawl_opts(a: &Args) -> Result<crawl::Opts, String> {
     let net = netcfg::by_name(a.req("network")?).ok_or("--network must be mainnet, signet or testnet4")?;
     util::set_stream_rate(a.num("stream-rate", 2.0)?);
     let home = a.home();
@@ -108,10 +121,7 @@ async fn crawl(a: &Args) -> Result<(), String> {
         gossip_onion: a.num("gossip-onion", 500)?,
         gossip_max_age: Duration::from_secs(a.num("gossip-max-age-days", 3u64)? * 86_400),
     };
-    let (path, run) = crawl::run(o).await?;
-    println!("{}", path.display());
-    print_summary(&run);
-    Ok(())
+    Ok(o)
 }
 
 fn print_summary(r: &results::Run) {
@@ -136,11 +146,8 @@ fn print_summary(r: &results::Run) {
     println!("  failures: {:?}", s.failures);
 }
 
-fn list_cmd(a: &Args) -> Result<(), String> {
-    let network = a.req("network")?;
-    netcfg::by_name(network).ok_or("--network must be mainnet, signet or testnet4")?;
-    let key = keys::SecretKey::load(&PathBuf::from(a.req("key")?))?;
-    let rule = list::Rule { last: a.num("last", 7)?, min_pass: a.num("min-pass", 6)? };
+/// The signed list under `rule` from the network's runs, as pretty JSON.
+fn signed_list(a: &Args, network: &str, rule: &list::Rule, key: &keys::SecretKey) -> Result<(list::PeerList, String), String> {
     let runs = crawl::load_runs(&a.home().join("runs").join(network), rule.last);
     let created = util::unix_now();
     let version: u64 = a.num("version", util::stamp(created)[..13].replace('T', "").parse().unwrap_or(1))?;
@@ -149,24 +156,76 @@ fn list_cmd(a: &Args) -> Result<(), String> {
         Some("peer-agreement") => "not checked against our own node: filter headers agreed by a majority of independent peers",
         _ => "handshake only",
     };
+    let test = if key.key_id.starts_with("test-") { " Signed with a TEST key: not a release." } else { "" };
     let default_note = format!(
-        "Onion v3 peers serving BIP157 compact filters that passed every check over Tor in {} of the last {} runs ({checked}). Signed with a TEST key: not a release.",
+        "Onion v3 peers serving BIP157 compact filters that passed every check over Tor in {} of the last {} runs ({checked}).{test}",
         rule.min_pass, rule.last
     );
     let note = a.get("note").map(String::from).unwrap_or(default_note);
-    let mut built = list::build(&runs, network, &rule, version, created, &note)?;
-    built.list.sign(&key);
-    let body = serde_json::to_string_pretty(&built.list).map_err(|e| e.to_string())? + "\n";
-    match a.get("out") {
-        Some(p) => std::fs::write(p, &body).map_err(|e| format!("{p}: {e}"))?,
-        None => print!("{body}"),
-    }
+    let mut built = list::build(&runs, network, rule, version, created, &note)?;
+    built.list.sign(key);
     eprintln!("{network}: {} peers from {} runs ({:?}); {} peers passed at least once", built.list.peers.len(), built.runs.len(), built.runs, built.counts.len());
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for (_, n) in &built.counts {
         *hist.entry(*n).or_default() += 1;
     }
     eprintln!("passes -> peers: {hist:?}");
+    let body = serde_json::to_string_pretty(&built.list).map_err(|e| e.to_string())? + "\n";
+    Ok((built.list, body))
+}
+
+fn list_cmd(a: &Args) -> Result<(), String> {
+    let network = a.req("network")?;
+    netcfg::by_name(network).ok_or("--network must be mainnet, signet or testnet4")?;
+    let key = keys::SecretKey::load(&PathBuf::from(a.req("key")?))?;
+    let rule = list::Rule { last: a.num("last", 7)?, min_pass: a.num("min-pass", 6)? };
+    let (_, body) = signed_list(a, network, &rule, &key)?;
+    match a.get("out") {
+        Some(p) => std::fs::write(p, &body).map_err(|e| format!("{p}: {e}"))?,
+        None => print!("{body}"),
+    }
+    Ok(())
+}
+
+/// One budgeted crawl (unless --no-crawl), then the peers that passed every check in each of
+/// the last `--runs` runs, signed. scripts/install-release.sh puts it in the node module.
+async fn release(a: &Args) -> Result<(), String> {
+    let network = a.req("network")?;
+    netcfg::by_name(network).ok_or("--network must be mainnet, signet or testnet4")?;
+    let key = keys::SecretKey::load(&PathBuf::from(a.req("key")?))?;
+    let dir = a.get("out").map(PathBuf::from).unwrap_or_else(|| a.home().join("release"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let runs: usize = a.num("runs", 1)?;
+    if runs == 0 {
+        return Err("--runs must be at least 1".into());
+    }
+    if a.get("no-crawl").is_none() {
+        let (path, run) = crawl::run(crawl_opts(a)?).await?;
+        println!("{}", path.display());
+        print_summary(&run);
+        // Interrupted: nothing signed, though `--no-crawl` may still sign from the run kept.
+        if run.summary.stopped_early {
+            return Err(format!("the {network} crawl stopped early; nothing signed"));
+        }
+    }
+    let (list, body) = signed_list(a, network, &list::Rule { last: runs, min_pass: runs }, &key)?;
+    if list.peers.is_empty() {
+        return Err(format!("no {network} peer passed every check in the last {runs} runs; nothing written"));
+    }
+    let out = dir.join(format!("{network}.json"));
+    std::fs::write(&out, body).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("{}: {} peers, version {}, key {}", out.display(), list.peers.len(), list.version, key.key_id);
+    Ok(())
+}
+
+fn seeds_cmd(a: &Args) -> Result<(), String> {
+    let out = PathBuf::from(a.req("out")?);
+    for s in seeds::extract(&PathBuf::from(a.req("core-src")?))? {
+        let path = out.join(format!("seeds-{}.json", s.network));
+        let body = serde_json::to_string_pretty(&s).map_err(|e| e.to_string())? + "\n";
+        std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+        println!("{}: {} onion seeds ({})", path.display(), s.peers.len(), s.source);
+    }
     Ok(())
 }
 
@@ -229,6 +288,8 @@ async fn main() {
         Err(e) => Err(e),
         Ok(a) => match cmd.as_str() {
             "crawl" => crawl(&a).await,
+            "release" => release(&a).await,
+            "seeds" => seeds_cmd(&a),
             "list" => list_cmd(&a),
             "verify" => verify_cmd(&a),
             "keygen" => keygen(&a),
@@ -248,5 +309,50 @@ async fn main() {
     if let Err(e) = r {
         eprintln!("peer-list {cmd}: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::results::{PeerResult, Run};
+    use std::path::Path;
+
+    fn args(v: &[&str]) -> Args {
+        Args::parse(v.iter().map(|s| s.to_string()).collect()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_release_keeps_peers_that_passed_every_run() {
+        let home = tempfile::tempdir().unwrap();
+        let runs = home.path().join("runs/signet");
+        std::fs::create_dir_all(&runs).unwrap();
+        let (a, b) = (format!("{}:38333", onion::from_pubkey(&[1; 32])), format!("{}:38333", onion::from_pubkey(&[2; 32])));
+        // a passes both runs, b only the newer one.
+        for (i, passed) in [vec![a.clone()], vec![a.clone(), b.clone()]].into_iter().enumerate() {
+            let t = 1_791_000_000 + i as u64 * 86_400;
+            let peers = passed.into_iter().map(|addr| PeerResult { addr, passed: true, ..PeerResult::default() }).collect();
+            let run = Run { network: "signet".into(), started_unix: t, started: util::rfc3339(t), peers, ..Run::default() };
+            std::fs::write(runs.join(format!("{i}.json")), serde_json::to_vec(&run).unwrap()).unwrap();
+        }
+        let key = keys::SecretKey::generate("test").unwrap();
+        let secret = home.path().join("test.secret");
+        key.save(&secret, "test").unwrap();
+        let (h, k) = (home.path().to_str().unwrap(), secret.to_str().unwrap());
+        let read = |p: &Path| serde_json::from_slice::<list::PeerList>(&std::fs::read(p).unwrap()).unwrap();
+
+        release(&args(&["--network", "signet", "--key", k, "--home", h, "--no-crawl"])).await.unwrap();
+        let one = read(&home.path().join("release/signet.json"));
+        assert_eq!(one.peers, vec![a.clone(), b.clone()], "one run: everything that passed it");
+        one.verify(&key.public()).unwrap();
+        assert!(one.note.contains("TEST key"), "{}", one.note);
+
+        let out = home.path().join("two");
+        release(&args(&["--network", "signet", "--key", k, "--home", h, "--no-crawl", "--runs", "2", "--out", out.to_str().unwrap()])).await.unwrap();
+        assert_eq!(read(&out.join("signet.json")).peers, vec![a], "two runs: only the peer that passed both");
+
+        let e = release(&args(&["--network", "signet", "--key", k, "--home", h, "--no-crawl", "--runs", "3"])).await.unwrap_err();
+        assert!(e.contains("2 signet runs, and the rule needs 3 passes"), "{e}");
+        assert!(release(&args(&["--network", "mainnet", "--key", k, "--home", h, "--no-crawl"])).await.unwrap_err().contains("0 mainnet runs"));
     }
 }
