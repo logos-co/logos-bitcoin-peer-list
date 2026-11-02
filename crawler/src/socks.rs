@@ -106,6 +106,41 @@ async fn request(proxy: SocketAddr, cmd: u8, target: &Target<'_>, port: u16, iso
     Ok((s, bound))
 }
 
+/// Where a run's connections go: through Tor's SOCKS port, or straight out for a clearnet list.
+#[derive(Debug, Clone, Copy)]
+pub enum Dialer {
+    Tor(SocketAddr),
+    Direct,
+}
+
+impl Dialer {
+    /// A stream to `target:port`: on a fresh Tor circuit, or directly, addresses only.
+    pub async fn connect(&self, target: &Target<'_>, port: u16) -> Result<TcpStream, String> {
+        match (self, target) {
+            (Dialer::Tor(proxy), _) => connect(*proxy, target, port, &crate::util::isolation()).await,
+            (Dialer::Direct, Target::Ip(ip)) => {
+                crate::util::pace().await;
+                let s = TcpStream::connect((*ip, port)).await.map_err(|e| format!("tcp: {e}"))?;
+                s.set_nodelay(true).ok();
+                Ok(s)
+            }
+            (Dialer::Direct, Target::Name(n)) => Err(format!("tcp: {n}: a clearnet run dials addresses only")),
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Dialer::Tor(p) => p.to_string(),
+            Dialer::Direct => "direct".into(),
+        }
+    }
+}
+
+/// An IP address as an address target, anything else as a name for Tor to resolve.
+pub fn target_of(host: &str) -> Target<'_> {
+    host.parse::<IpAddr>().map(Target::Ip).unwrap_or(Target::Name(host))
+}
+
 /// A stream to `target:port` through Tor, on the circuit `isolation` names.
 pub async fn connect(proxy: SocketAddr, target: &Target<'_>, port: u16, isolation: &str) -> Result<TcpStream, String> {
     request(proxy, CMD_CONNECT, target, port, isolation).await.map(|(s, _)| s)

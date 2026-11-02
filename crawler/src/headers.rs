@@ -1,7 +1,6 @@
 //! The mainnet header chain from Kyoto's taproot checkpoint, checked for proof of work and
 //! difficulty, so every peer gets the same recent stop block in the cfheaders check.
 
-use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -12,8 +11,7 @@ use bitcoin::pow::{CompactTarget, Work};
 use bitcoin::{BlockHash, Network};
 
 use crate::p2p::Conn;
-use crate::socks::{self, Target};
-use crate::util::isolation;
+use crate::socks::{target_of, Dialer};
 
 /// Kyoto's `HashCheckpoint::taproot_activation()` at bip157 0.7.0 (copied from its source).
 pub const BASE_HEIGHT: u32 = 709_631;
@@ -175,9 +173,9 @@ pub struct SyncOutcome {
 }
 
 /// Follows one peer to its tip; Ok(true) when it has nothing past ours.
-async fn follow(chain: &mut Chain, params: &Params, network: Network, proxy: SocketAddr, addr: &str, fetched: &mut usize, best: &mut i32) -> Result<bool, String> {
+async fn follow(chain: &mut Chain, params: &Params, network: Network, dialer: Dialer, addr: &str, fetched: &mut usize, best: &mut i32) -> Result<bool, String> {
     let (host, port) = crate::onion::split_host_port(addr).ok_or("bad address")?;
-    let tcp = tokio::time::timeout(Duration::from_secs(60), socks::connect(proxy, &Target::Name(host), port, &isolation()))
+    let tcp = tokio::time::timeout(Duration::from_secs(60), dialer.connect(&target_of(host), port))
         .await
         .map_err(|_| "connect timeout".to_string())??;
     let mut c = Conn::new(tcp, network);
@@ -193,7 +191,7 @@ async fn follow(chain: &mut Chain, params: &Params, network: Network, proxy: Soc
 }
 
 /// Syncs from up to 16 peers until 3 have nothing past our tip; saves progress after each.
-pub async fn sync(chain: &mut Chain, path: &Path, network: Network, proxy: SocketAddr, peers: &[String]) -> SyncOutcome {
+pub async fn sync(chain: &mut Chain, path: &Path, network: Network, dialer: Dialer, peers: &[String]) -> SyncOutcome {
     let params = Params::new(network);
     let mut o = SyncOutcome { tried: 0, confirmed: 0, fetched: 0, max_peer_height: 0, errors: vec![] };
     for addr in peers.iter().take(16) {
@@ -201,7 +199,7 @@ pub async fn sync(chain: &mut Chain, path: &Path, network: Network, proxy: Socke
             break;
         }
         o.tried += 1;
-        let r = tokio::time::timeout(Duration::from_secs(900), follow(chain, &params, network, proxy, addr, &mut o.fetched, &mut o.max_peer_height)).await;
+        let r = tokio::time::timeout(Duration::from_secs(900), follow(chain, &params, network, dialer, addr, &mut o.fetched, &mut o.max_peer_height)).await;
         match r {
             Ok(Ok(true)) => o.confirmed += 1,
             Ok(Ok(false)) => o.errors.push(format!("{addr}: claims a higher tip than it served")),

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One release crawl per network, at release time only: our Tor (and for signet our signet node),
-# `peer-list release` for each network, then both stopped by PID. The signed lists land in
-# $BPL_HOME/release; install-release.sh puts them in the node module.
+# `peer-list release` for each network, onion then clearnet (direct), then both stopped by PID.
+# The signed lists land in $BPL_HOME/release; install-release.sh puts them in the node module.
 # Usage: BPL_KEY=SECRET [BPL_RELEASE_RUNS=N] release.sh [mainnet] [signet] [testnet4]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -43,6 +43,9 @@ for net in $nets; do
     # shellcheck disable=SC2086 # $rpc is two flag pairs, paths without spaces
     "$BIN_DIR/peer-list" release --network "$net" --home "$BPL_HOME" --socks "$BPL_SOCKS" \
         --key "$BPL_KEY" --runs "$runs" $rpc || { echo "$(utc_now) $net: no list" >&2; status=1; }
+    # shellcheck disable=SC2086
+    "$BIN_DIR/peer-list" release --clearnet --network "$net" --home "$BPL_HOME" --socks "$BPL_SOCKS" \
+        --key "$BPL_KEY" --runs "$runs" $rpc || { echo "$(utc_now) $net: no clearnet list" >&2; status=1; }
 done
 ls -l "$BPL_HOME/release"
 exit $status

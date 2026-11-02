@@ -3,7 +3,7 @@
 Curates the onion peers that the Logos Bitcoin wallet gives Kyoto (bip157, the BIP157/158 light
 client) with `whitelist_only`, so Kyoto never resolves a name. It runs at release time on our
 build infrastructure, never on a user's device and never as a service, and every connection it
-makes goes through Tor. The output is a signed list per network that `bitcoin_node_module`
+makes goes through Tor, except a clearnet run's (see "The clearnet list"). The output is a signed list per network that `bitcoin_node_module`
 ships and verifies; it seeds each install's own peer book, which that install keeps fresh.
 
 Spike 5 of the Bitcoin wallet plan: at least 50 mainnet and 10 signet onion peers pass every
@@ -73,6 +73,35 @@ creation time as `YYYYMMDDHHMM`, so a newer list always has a larger version.
 **The key in `keys/` is a TEST key.** Its secret was generated locally and is kept outside this
 repository; the release key, and where it lives, is still to be decided.
 
+## The clearnet list
+
+For the wallet's "Use Tor for: identifying traffic" mode, Kyoto takes headers and filters from
+direct IPv4 and IPv6 peers. `--clearnet` on `crawl`, `release` and `list` makes a run of those:
+
+- every connection is direct, never through Tor; runs go to `runs/<network>-clearnet/`;
+- candidates: the DNS seeds' `x49.<seed>` A and AAAA records from the system resolver, x49
+  IPv4 and IPv6 gossip (up to 1000 a run), our own node's `getnodeaddresses 0 ipv4|ipv6`, and
+  earlier clearnet runs; btcnodes.io and onion gossip are skipped;
+- the same checks: bits 0, 3 and 6, protocol 70016 or newer (every run checks this), and
+  `getcfheaders` against the same references, mainnet's header chain synced directly.
+
+The list keeps public addresses only (no private, loopback, link-local, CGNAT, ULA,
+documentation or multicast ranges), at most 2 peers per /16 (IPv4) or /32 (IPv6), ranked by
+passes then latency, and each peer's services from the newest run it passed, so the wallet
+knows which offer BIP324 (bit 11):
+
+```json
+{"format":1,"network":"mainnet","version":"202611021200","created":"2026-11-02T12:00:00Z",
+ "date":"2026-11-02","note":"...","refreshUrl":null,
+ "peers":[{"peer":"1.2.3.4:8333","services":"3145"}],
+ "keyId":"test-d680f3cac9837bf9","signature":"<128 hex>"}
+```
+
+Signed the same way under its own domain tag, `logos-bitcoin-clearnet-peers/1\n`, so neither
+list's signature passes for the other. `release --clearnet` writes `clearnet-<network>.json`;
+`peer-list seeds` also writes Core's public IPv4 and IPv6 fixed seeds to
+`clearnet-seeds-<network>.json`.
+
 ## Running it
 
 On framework.lan, everything lives under `~/btc-peer-list` (`BPL_HOME`); see `scripts/env.sh`
@@ -110,7 +139,8 @@ book runs short.
    ```
 
    It starts our Tor (and the signet node, waiting for its tip), runs `peer-list release` per
-   network into `$BPL_HOME/release/<network>.json`, and stops both by PID.
+   network into `$BPL_HOME/release/<network>.json`, then `release --clearnet` into
+   `clearnet-<network>.json`, and stops both by PID.
 2. Optionally, Kyoto against each list: `scripts/kyoto-check.sh mainnet
    $BPL_HOME/release/mainnet.json KEY.pub.json`, the same for signet, with our Tor up (and our
    signet node, for signet) and stopped after by their stop scripts.
@@ -122,8 +152,8 @@ book runs short.
 
    Every list must verify against a key the module compiles in (`rust-lib/keys/`), name its own
    network and be newer than the one shipped, or nothing is copied. Then the seeds go to
-   `rust-lib/peer-lists/seeds-<network>.json`, from logos-bitcoin-core-nix's `bitcoin-core-src`
-   (`BPL_CORE_SRC` names another tree).
+   `rust-lib/peer-lists/seeds-<network>.json` and `clearnet-seeds-<network>.json`, from
+   logos-bitcoin-core-nix's `bitcoin-core-src` (`BPL_CORE_SRC` names another tree).
 4. Run the node module's tests and commit the lists and seeds there.
 
 Where the signing key is not on the crawl host: crawl there (`peer-list crawl`), copy
