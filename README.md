@@ -58,21 +58,22 @@ peer-list verify mainnet.json
 ```
 
 A peer is listed when it passed every check in at least `--min-pass` of the last `--last` runs
-(the plan's rule is 6 of 7). The list is the node module's format 1:
+(the plan's rule is 6 of 7). The list is the node module's format 2:
 
 ```json
-{"format":1,"network":"mainnet","version":"202610181200","created":"2026-10-18T12:00:00Z",
- "date":"2026-10-18","note":"...","refreshUrl":null,"peers":["<56>.onion:8333"]}
+{"format":2,"network":"mainnet","version":"202610181200","created":"2026-10-18T12:00:00Z",
+ "date":"2026-10-18","note":"...","peers":["<56>.onion:8333"]}
 ```
 
 `version` defaults to the creation time as `YYYYMMDDHHMM`, so a newer list always has a larger
-version. `verify` checks that a list is well formed: format 1, a known network, a decimal
-version, the shapes of `created` and `date`, and every peer an onion v3 `host:port` (in the
-clearnet list, a public IPv4 or IPv6 `host:port` with decimal services).
+version. `verify` checks that a list is well formed: format 2, a known network, a decimal
+version, the shapes of `created` and `date`, at least one peer, and every peer an onion v3
+`host:port` (in the clearnet list, a public IPv4 or IPv6 `host:port` with decimal services).
 
 **The lists are not signed.** The node module compiles them in (`include_str!`), nothing
-fetches them at runtime, and Jenkins signs the packages. A list fetched at runtime
-(`refreshUrl`) would need a signature again.
+fetches them at runtime, and Jenkins signs the packages. Hence format 2: `keyId`, `signature`
+and `refreshUrl` left with the signature. A list fetched at runtime would need a signature and
+a newer format.
 
 ## The clearnet list
 
@@ -92,9 +93,8 @@ passes then latency, and each peer's services from the newest run it passed, so 
 knows which offer BIP324 (bit 11):
 
 ```json
-{"format":1,"network":"mainnet","version":"202611021200","created":"2026-11-02T12:00:00Z",
- "date":"2026-11-02","note":"...","refreshUrl":null,
- "peers":[{"peer":"1.2.3.4:8333","services":"3145"}]}
+{"format":2,"network":"mainnet","version":"202611021200","created":"2026-11-02T12:00:00Z",
+ "date":"2026-11-02","note":"...","peers":[{"peer":"1.2.3.4:8333","services":"3145"}]}
 ```
 
 `release --clearnet` writes `clearnet-<network>.json`;

@@ -36,7 +36,7 @@ const USAGE: &str = "usage:
                     seeds-NET.json, public IPv4 and IPv6 in clearnet-seeds-NET.json)
   peer-list list    --network NET [--home DIR] [--last 7] [--min-pass 6]
                     [--version N] [--note TEXT] [--out FILE] [--clearnet]
-  peer-list verify  LIST...   (well formed: format 1, a known network, valid peers and dates)
+  peer-list verify  LIST...   (well formed: format 2, a known network, valid dates, valid peers, at least one)
   peer-list summary RUN.json...
   peer-list headers [--home DIR] [--socks ADDR] [--back N]   (mainnet: sync, print tip and tip-N)";
 
@@ -162,7 +162,7 @@ struct Listed {
     body: String,
 }
 
-/// The list under `rule` from the network's runs, as pretty JSON.
+/// The list under `rule` from the network's runs, as pretty JSON; never an empty or malformed one.
 fn make_list(a: &Args, network: &str, rule: &list::Rule) -> Result<Listed, String> {
     let clearnet = a.clearnet();
     let runs = crawl::load_runs(&a.home().join("runs").join(crawl::runs_name(network, clearnet)), rule.last);
@@ -182,12 +182,12 @@ fn make_list(a: &Args, network: &str, rule: &list::Rule) -> Result<Listed, Strin
         format!("Onion v3 peers serving BIP157 compact filters that passed every check over Tor in {} of the last {} runs ({checked}).", rule.min_pass, rule.last)
     };
     let note = a.get("note").map(String::from).unwrap_or(default_note);
-    let (built, listed) = if clearnet {
+    let (built, listed, ok) = if clearnet {
         let (l, built) = list::build_clearnet(&runs, network, rule, version, created, &note)?;
-        (built, Listed { peers: l.peers.len(), version: l.version.clone(), body: pretty(&l)? })
+        (built, Listed { peers: l.peers.len(), version: l.version.clone(), body: pretty(&l)? }, l.check())
     } else {
         let (l, built) = list::build(&runs, network, rule, version, created, &note)?;
-        (built, Listed { peers: l.peers.len(), version: l.version.clone(), body: pretty(&l)? })
+        (built, Listed { peers: l.peers.len(), version: l.version.clone(), body: pretty(&l)? }, l.check())
     };
     eprintln!("{network}: {} peers from {} runs ({:?}); {} peers passed at least once", listed.peers, built.runs.len(), built.runs, built.counts.len());
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
@@ -195,6 +195,10 @@ fn make_list(a: &Args, network: &str, rule: &list::Rule) -> Result<Listed, Strin
         *hist.entry(*n).or_default() += 1;
     }
     eprintln!("passes -> peers: {hist:?}");
+    if listed.peers == 0 {
+        return Err(format!("no {network} peer passed every check in {} of the last {} runs; nothing written", rule.min_pass, rule.last));
+    }
+    ok.map_err(|e| format!("the {network} list is not well formed ({e}); nothing written"))?;
     Ok(listed)
 }
 
@@ -231,9 +235,6 @@ async fn release(a: &Args) -> Result<(), String> {
         }
     }
     let list = make_list(a, network, &list::Rule { last: runs, min_pass: runs })?;
-    if list.peers == 0 {
-        return Err(format!("no {network} peer passed every check in the last {runs} runs; nothing written"));
-    }
     let out = dir.join(if a.clearnet() { format!("clearnet-{network}.json") } else { format!("{network}.json") });
     std::fs::write(&out, list.body).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("{}: {} peers, version {}", out.display(), list.peers, list.version);
@@ -380,5 +381,27 @@ mod tests {
         assert_eq!((l.peers[0].peer.as_str(), l.peers[0].services.as_str()), ("1.2.3.4:38333", "3145"));
         verify(&home.path().join("release/clearnet-signet.json")).unwrap();
         assert_eq!(read(&home.path().join("release/signet.json")).peers.len(), 2, "the onion list is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_passing_peer_writes_no_list() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_str().unwrap();
+        for (dir, clearnet, addr) in [("signet", false, format!("{}:38333", onion::from_pubkey(&[1; 32]))), ("signet-clearnet", true, "1.2.3.4:38333".into())] {
+            let runs = home.path().join("runs").join(dir);
+            std::fs::create_dir_all(&runs).unwrap();
+            let peer = PeerResult { addr, passed: false, services: Some("0xc49".into()), ..PeerResult::default() };
+            let run = Run { network: "signet".into(), clearnet, started_unix: 1_791_000_000, peers: vec![peer], ..Run::default() };
+            std::fs::write(runs.join("0.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+        }
+        let out = home.path().join("list.json");
+        for extra in [vec![], vec!["--clearnet"]] {
+            let v = [vec!["--network", "signet", "--home", h, "--no-crawl"], extra.clone()].concat();
+            let e = release(&args(&v)).await.unwrap_err();
+            assert_eq!(e, "no signet peer passed every check in 1 of the last 1 runs; nothing written");
+            let v = [vec!["--network", "signet", "--home", h, "--last", "1", "--min-pass", "1", "--out", out.to_str().unwrap()], extra].concat();
+            assert!(list_cmd(&args(&v)).unwrap_err().starts_with("no signet peer passed"));
+        }
+        assert!(!home.path().join("release/signet.json").exists() && !home.path().join("release/clearnet-signet.json").exists() && !out.exists());
     }
 }

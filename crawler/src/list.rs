@@ -11,7 +11,8 @@ use crate::onion;
 use crate::results::Run;
 use crate::util::{day, rfc3339};
 
-pub const FORMAT: u32 = 1;
+/// 2: `keyId`, `signature` and `refreshUrl` left with the signature.
+pub const FORMAT: u32 = 2;
 /// The node module refuses longer lists.
 pub const MAX_PEERS: usize = 1024;
 /// Clearnet peers kept per /16 (IPv4) or /32 (IPv6), so no one network holds the list.
@@ -29,7 +30,6 @@ pub struct PeerList {
     /// The UTC day of the last run it counts.
     pub date: Option<String>,
     pub note: String,
-    pub refresh_url: Option<String>,
     pub peers: Vec<String>,
 }
 
@@ -64,7 +64,6 @@ pub struct ClearnetList {
     pub created: String,
     pub date: Option<String>,
     pub note: String,
-    pub refresh_url: Option<String>,
     pub peers: Vec<ClearnetPeer>,
 }
 
@@ -90,7 +89,8 @@ impl ClearnetList {
     }
 }
 
-/// What both lists share: format 1, a known network, a decimal version, the dates' shapes.
+/// What both lists share: format 2, a known network, a decimal version, the dates' shapes, and
+/// at least one peer.
 fn check_header(format: u32, network: &str, version: &str, created: &str, date: Option<&str>, peers: usize) -> Result<(), String> {
     if format != FORMAT {
         return Err(format!("format {format} is not {FORMAT}"));
@@ -104,6 +104,9 @@ fn check_header(format: u32, network: &str, version: &str, created: &str, date: 
     }
     if let Some(d) = date.filter(|d| !date_ok(d.as_bytes())) {
         return Err(format!("date {d:?} is not YYYY-MM-DD"));
+    }
+    if peers == 0 {
+        return Err("no peers".into());
     }
     if peers > MAX_PEERS {
         return Err(format!("{peers} peers, more than {MAX_PEERS}"));
@@ -222,7 +225,6 @@ pub fn build(runs: &[Run], network: &str, rule: &Rule, version: u64, created: u6
         created: rfc3339(created),
         date: runs.last().map(|r| day(r.started_unix)),
         note: note.into(),
-        refresh_url: None,
         peers,
     };
     Ok((list, Built { counts, runs: runs.iter().map(|r| r.started.clone()).collect() }))
@@ -264,7 +266,6 @@ pub fn build_clearnet(runs: &[Run], network: &str, rule: &Rule, version: u64, cr
         created: rfc3339(created),
         date: runs.last().map(|r| day(r.started_unix)),
         note: note.into(),
-        refresh_url: None,
         peers,
     };
     Ok((list, Built { counts, runs: runs.iter().map(|r| r.started.clone()).collect() }))
@@ -316,11 +317,12 @@ mod tests {
         l.peers.push(format!("{}:38333", onion::from_pubkey(&[3; 32])));
         let body = serde_json::to_string(&l).unwrap();
         // The node module's field order, with nothing after the peers.
-        assert!(body.starts_with("{\"format\":1,\"network\":\"signet\",\"version\":\"1\",\"created\":\"1970-01-01T00:00:09Z\",\"date\":\"1970-01-01\",\"note\":\"n\",\"refreshUrl\":null,\"peers\":[\""), "{body}");
+        assert!(body.starts_with("{\"format\":2,\"network\":\"signet\",\"version\":\"1\",\"created\":\"1970-01-01T00:00:09Z\",\"date\":\"1970-01-01\",\"note\":\"n\",\"peers\":[\""), "{body}");
         assert!(body.ends_with(".onion:38333\"]}"), "{body}");
         assert_eq!(verify_any(body.as_bytes()).unwrap(), "signet v1 1 onion peers");
-        let bad: [Bad<PeerList>; 9] = [
-            (|l: &mut PeerList| l.format = 2, "format 2 is not 1"),
+        let bad: [Bad<PeerList>; 10] = [
+            (|l: &mut PeerList| l.format = 1, "format 1 is not 2"),
+            (|l: &mut PeerList| l.peers.clear(), "no peers"),
             (|l: &mut PeerList| l.network = "regtest".into(), "unknown network"),
             (|l: &mut PeerList| l.version = "01".into(), "not a decimal u64"),
             (|l: &mut PeerList| l.created = "1970-01-01".into(), "created \"1970-01-01\" is not"),
@@ -336,9 +338,11 @@ mod tests {
             let e = verify_any(&serde_json::to_vec(&t).unwrap()).unwrap_err();
             assert!(e.contains(why), "{e}");
         }
-        // A list in the old signed shape is refused, not read with its signature ignored.
-        let old = format!("{},\"keyId\":\"test-d680f3cac9837bf9\",\"signature\":null}}", &body[..body.len() - 1]);
-        assert!(verify_any(old.as_bytes()).unwrap_err().contains("unknown field `keyId`"));
+        // Format 1 lists are refused: signed ones, and the unsigned ones that kept `refreshUrl`.
+        let one = body.replacen("\"format\":2", "\"format\":1", 1).replacen("\"note\":\"n\",", "\"note\":\"n\",\"refreshUrl\":null,", 1);
+        let signed = format!("{},\"keyId\":\"test-d680f3cac9837bf9\",\"signature\":null}}", &one[..one.len() - 1]);
+        assert!(verify_any(one.as_bytes()).unwrap_err().contains("unknown field `refreshUrl`"));
+        assert!(verify_any(signed.as_bytes()).unwrap_err().contains("unknown field `refreshUrl`"));
     }
 
     #[test]
@@ -381,7 +385,8 @@ mod tests {
         let body = serde_json::to_string(&l).unwrap();
         assert!(body.ends_with("\"peers\":[{\"peer\":\"1.2.5.5:38333\",\"services\":\"1097\"},{\"peer\":\"1.2.9.9:38333\",\"services\":\"3145\"},{\"peer\":\"[2a01:4f8::1]:38333\",\"services\":\"1097\"}]}"), "{body}");
         assert_eq!(verify_any(body.as_bytes()).unwrap(), "signet v7 3 clearnet peers");
-        let bad: [Bad<ClearnetList>; 7] = [
+        let bad: [Bad<ClearnetList>; 8] = [
+            (|l: &mut ClearnetList| l.peers.clear(), "no peers"),
             (|l: &mut ClearnetList| l.peers[0].services = "0x449".into(), "services \"0x449\" are not a decimal u64"),
             (|l: &mut ClearnetList| l.peers[0].peer = "192.168.1.1:38333".into(), "192.168.1.1:38333 is not a public"),
             (|l: &mut ClearnetList| l.peers[0].peer = "1.2.5.5".into(), "1.2.5.5 is not a public"),
