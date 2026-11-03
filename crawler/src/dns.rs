@@ -1,5 +1,6 @@
 //! DNS seeds asked for x49 through Tor's RESOLVE. Tor answers one address per query, so each
-//! seed is asked a few times, each on a fresh circuit (another exit, another resolver).
+//! seed is asked a few times, each on a fresh circuit (another exit, another resolver). A
+//! clearnet run asks the system resolver instead, once per seed, for every A and AAAA record.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr};
@@ -42,6 +43,28 @@ pub async fn query_all(proxy: SocketAddr, seeds: &[&str], queries: u32, timeout:
     for (r, f) in results.iter_mut().zip(found) {
         r.addresses = f.iter().map(IpAddr::to_string).collect();
         all.extend(f);
+    }
+    (results, all.into_iter().collect())
+}
+
+/// Every address the system resolver gives for each seed's `x49.` name.
+pub async fn query_local(seeds: &[&str], port: u16, timeout: Duration) -> (Vec<SeedResult>, Vec<IpAddr>) {
+    let mut results = Vec::with_capacity(seeds.len());
+    let mut all = BTreeSet::new();
+    for seed in seeds {
+        let name = format!("x49.{seed}");
+        let mut r = SeedResult { name: name.clone(), queries: 1, ..SeedResult::default() };
+        match tokio::time::timeout(timeout, tokio::net::lookup_host((name.as_str(), port))).await {
+            Ok(Ok(addrs)) => {
+                let found: BTreeSet<IpAddr> = addrs.map(|a| a.ip()).collect();
+                r.answers = u32::from(!found.is_empty());
+                r.addresses = found.iter().map(IpAddr::to_string).collect();
+                all.extend(found);
+            }
+            Ok(Err(e)) => *r.errors.entry(format!("resolve: {e}")).or_default() += 1,
+            Err(_) => *r.errors.entry("timeout".into()).or_default() += 1,
+        }
+        results.push(r);
     }
     (results, all.into_iter().collect())
 }

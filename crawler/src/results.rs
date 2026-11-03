@@ -11,6 +11,9 @@ pub struct Run {
     pub format: u32,
     pub tool: String,
     pub network: String,
+    /// IPv4 and IPv6 peers dialled directly, for the clearnet list.
+    #[serde(default)]
+    pub clearnet: bool,
     pub started: String,
     pub started_unix: u64,
     pub finished: String,
@@ -18,9 +21,9 @@ pub struct Run {
     pub sources: Sources,
     pub reference: Reference,
     pub summary: Summary,
-    /// Onion v3 candidates, each checked once.
+    /// Listed candidates (onion v3, or IP in a clearnet run), each checked once.
     pub peers: Vec<PeerResult>,
-    /// Clearnet peers from the DNS seeds, dialled through Tor exits for their addrv2 gossip only.
+    /// Onion runs: clearnet peers from the DNS seeds, dialled through Tor exits for their gossip only.
     pub gossip_peers: Vec<PeerResult>,
 }
 

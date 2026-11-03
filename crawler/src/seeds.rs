@@ -1,6 +1,8 @@
-//! Bitcoin Core's fixed seeds, onion v3 only, per network: the node module ships them as its
-//! first-contact fallback. Read from a Core source tree's contrib/seeds/nodes_*.txt.
+//! Bitcoin Core's fixed seeds per network, onion v3 and, apart, public IPv4 and IPv6: the node
+//! module ships them as its first-contact fallback. Read from a Core source tree's
+//! contrib/seeds/nodes_*.txt.
 
+use std::net::IpAddr;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,27 @@ pub fn parse(text: &str) -> Vec<String> {
     out
 }
 
+/// The public IPv4 and IPv6 `host:port` lines of a seed file, sorted and unique.
+pub fn parse_clearnet(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter_map(|t| {
+            let (h, p) = onion::split_host_port(t)?;
+            let ip: IpAddr = h.parse().ok()?;
+            crate::list::public(&ip).then(|| match ip {
+                IpAddr::V4(a) => format!("{a}:{p}"),
+                IpAddr::V6(a) => format!("[{a}]:{p}"),
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// `31.1` from the tree's CMakeLists.txt, when it says.
 fn version(core_src: &Path) -> Option<String> {
     let text = std::fs::read_to_string(core_src.join("CMakeLists.txt")).ok()?;
@@ -42,7 +65,7 @@ fn version(core_src: &Path) -> Option<String> {
     Some(format!("{}.{}", field("CLIENT_VERSION_MAJOR")?, field("CLIENT_VERSION_MINOR")?))
 }
 
-pub fn extract(core_src: &Path) -> Result<Vec<Seeds>, String> {
+fn extract_with(core_src: &Path, kind: &str, parse: fn(&str) -> Vec<String>) -> Result<Vec<Seeds>, String> {
     let label = version(core_src).map(|v| format!("Bitcoin Core {v}")).unwrap_or_else(|| "Bitcoin Core".into());
     FILES
         .iter()
@@ -51,11 +74,19 @@ pub fn extract(core_src: &Path) -> Result<Vec<Seeds>, String> {
             let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
             let peers = parse(&text);
             if peers.is_empty() {
-                return Err(format!("{}: no onion v3 seeds", path.display()));
+                return Err(format!("{}: no {kind} seeds", path.display()));
             }
-            Ok(Seeds { format: FORMAT, network: net.to_string(), source: format!("{label} contrib/seeds/{file}, onion v3 only"), peers })
+            Ok(Seeds { format: FORMAT, network: net.to_string(), source: format!("{label} contrib/seeds/{file}, {kind} only"), peers })
         })
         .collect()
+}
+
+pub fn extract(core_src: &Path) -> Result<Vec<Seeds>, String> {
+    extract_with(core_src, "onion v3", parse)
+}
+
+pub fn extract_clearnet(core_src: &Path) -> Result<Vec<Seeds>, String> {
+    extract_with(core_src, "public IPv4 and IPv6", parse_clearnet)
 }
 
 #[cfg(test)]
@@ -70,6 +101,8 @@ mod tests {
             "# comment\n1.2.3.4:8333\n[2001:db8::1]:8333\n{good}:8333 # trailing\n{bad}:8333\nabcd.b32.i2p:0\n\n{good}:8333\n[fc00::1]:8333\n"
         );
         assert_eq!(parse(&text), vec![format!("{good}:8333")], "IP, I2P, CJDNS and a bad checksum dropped; duplicates once");
+        let text = format!("{text}10.0.0.1:8333\n[2a01:4f8::1]:8333\n1.2.3.4:8333\n");
+        assert_eq!(parse_clearnet(&text), ["1.2.3.4:8333", "[2a01:4f8::1]:8333"], "documentation, private and ULA ranges dropped");
     }
 
     #[test]

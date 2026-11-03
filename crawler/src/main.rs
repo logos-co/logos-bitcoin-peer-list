@@ -1,12 +1,11 @@
 //! peer-list: curates onion peers that serve BIP157 compact filters, for Kyoto's whitelist.
-//! Every connection goes through Tor's SOCKS port; only our own node's RPC stays on loopback.
+//! Every connection goes through Tor's SOCKS port, except a `--clearnet` run's, which go direct.
 
 mod btcnodes;
 mod crawl;
 mod dns;
 mod headers;
 mod http;
-mod keys;
 mod list;
 mod netcfg;
 mod onion;
@@ -28,15 +27,16 @@ const USAGE: &str = "usage:
                     [--range N] [--depth N] [--connect-timeout S] [--handshake-timeout S]
                     [--cfheaders-timeout S] [--getaddr-window S] [--previous N] [--gossip-clearnet N]
                     [--gossip-onion N] [--gossip-max-age-days N] [--stream-rate PER_SECOND]
-  peer-list release --network NET --key SECRET [--runs 1] [--no-crawl] [--out DIR]
-                    [crawl options]   (one budgeted crawl, then a signed list of the peers that
-                    passed every check in each of the last --runs runs: DIR/<network>.json,
-                    DIR defaults to HOME/release)
-  peer-list seeds   --core-src DIR --out DIR   (Core's onion v3 fixed seeds, per network)
-  peer-list list    --network NET --key SECRET [--home DIR] [--last 7] [--min-pass 6]
-                    [--version N] [--note TEXT] [--out FILE]
-  peer-list verify  --pubkey FILE LIST...
-  peer-list keygen  --secret FILE --pubkey FILE [--label test]
+                    [--clearnet]   (IPv4 and IPv6 peers, dialled directly, runs in HOME/runs/NET-clearnet)
+  peer-list release --network NET [--runs 1] [--no-crawl] [--out DIR] [--clearnet]
+                    [crawl options]   (one budgeted crawl, then a list of the peers that
+                    passed every check in each of the last --runs runs: DIR/<network>.json, or
+                    DIR/clearnet-<network>.json with --clearnet; DIR defaults to HOME/release)
+  peer-list seeds   --core-src DIR --out DIR   (Core's fixed seeds per network: onion v3 in
+                    seeds-NET.json, public IPv4 and IPv6 in clearnet-seeds-NET.json)
+  peer-list list    --network NET [--home DIR] [--last 7] [--min-pass 6]
+                    [--version N] [--note TEXT] [--out FILE] [--clearnet]
+  peer-list verify  LIST...   (well formed: format 2, a known network, valid dates, valid peers, at least one)
   peer-list summary RUN.json...
   peer-list headers [--home DIR] [--socks ADDR] [--back N]   (mainnet: sync, print tip and tip-N)";
 
@@ -51,7 +51,7 @@ impl Args {
         let mut it = v.into_iter();
         while let Some(a) = it.next() {
             if let Some(k) = a.strip_prefix("--") {
-                if k.starts_with("no-") {
+                if k.starts_with("no-") || k == "clearnet" {
                     flags.insert(k.to_string(), "true".into());
                 } else {
                     flags.insert(k.to_string(), it.next().ok_or(format!("--{k} needs a value"))?);
@@ -79,6 +79,10 @@ impl Args {
         self.get("home").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("btc-peer-list"))
     }
 
+    fn clearnet(&self) -> bool {
+        self.get("clearnet").is_some()
+    }
+
     fn socks(&self) -> Result<SocketAddr, String> {
         self.get("socks").unwrap_or("127.0.0.1:29050").parse().map_err(|_| "--socks: not ip:port".into())
     }
@@ -103,6 +107,7 @@ fn crawl_opts(a: &Args) -> Result<crawl::Opts, String> {
     let o = crawl::Opts {
         net,
         socks: a.socks()?,
+        clearnet: a.clearnet(),
         state_dir: home.join("state"),
         runs_dir: home.join("runs"),
         concurrency: a.num("concurrency", 32)?,
@@ -117,7 +122,8 @@ fn crawl_opts(a: &Args) -> Result<crawl::Opts, String> {
         rpc,
         seed_queries: a.num("seed-queries", 6)?,
         previous: a.num("previous", 7)?,
-        gossip_clearnet: a.num("gossip-clearnet", 100)?,
+        // A clearnet run lists the IP peers gossiped, so it takes more of them.
+        gossip_clearnet: a.num("gossip-clearnet", if a.clearnet() { 1000 } else { 100 })?,
         gossip_onion: a.num("gossip-onion", 500)?,
         gossip_max_age: Duration::from_secs(a.num("gossip-max-age-days", 3u64)? * 86_400),
     };
@@ -146,9 +152,20 @@ fn print_summary(r: &results::Run) {
     println!("  failures: {:?}", s.failures);
 }
 
-/// The signed list under `rule` from the network's runs, as pretty JSON.
-fn signed_list(a: &Args, network: &str, rule: &list::Rule, key: &keys::SecretKey) -> Result<(list::PeerList, String), String> {
-    let runs = crawl::load_runs(&a.home().join("runs").join(network), rule.last);
+fn pretty<T: serde::Serialize>(v: &T) -> Result<String, String> {
+    Ok(serde_json::to_string_pretty(v).map_err(|e| e.to_string())? + "\n")
+}
+
+struct Listed {
+    peers: usize,
+    version: String,
+    body: String,
+}
+
+/// The list under `rule` from the network's runs, as pretty JSON; never an empty or malformed one.
+fn make_list(a: &Args, network: &str, rule: &list::Rule) -> Result<Listed, String> {
+    let clearnet = a.clearnet();
+    let runs = crawl::load_runs(&a.home().join("runs").join(crawl::runs_name(network, clearnet)), rule.last);
     let created = util::unix_now();
     let version: u64 = a.num("version", util::stamp(created)[..13].replace('T', "").parse().unwrap_or(1))?;
     let checked = match runs.last().map(|r| r.reference.kind.as_str()) {
@@ -156,30 +173,40 @@ fn signed_list(a: &Args, network: &str, rule: &list::Rule, key: &keys::SecretKey
         Some("peer-agreement") => "not checked against our own node: filter headers agreed by a majority of independent peers",
         _ => "handshake only",
     };
-    let test = if key.key_id.starts_with("test-") { " Signed with a TEST key: not a release." } else { "" };
-    let default_note = format!(
-        "Onion v3 peers serving BIP157 compact filters that passed every check over Tor in {} of the last {} runs ({checked}).{test}",
-        rule.min_pass, rule.last
-    );
+    let default_note = if clearnet {
+        format!(
+            "IPv4 and IPv6 peers serving BIP157 compact filters that passed every check, dialled directly, in {} of the last {} runs ({checked}); at most {} per /16 or /32.",
+            rule.min_pass, rule.last, list::PER_NETGROUP
+        )
+    } else {
+        format!("Onion v3 peers serving BIP157 compact filters that passed every check over Tor in {} of the last {} runs ({checked}).", rule.min_pass, rule.last)
+    };
     let note = a.get("note").map(String::from).unwrap_or(default_note);
-    let mut built = list::build(&runs, network, rule, version, created, &note)?;
-    built.list.sign(key);
-    eprintln!("{network}: {} peers from {} runs ({:?}); {} peers passed at least once", built.list.peers.len(), built.runs.len(), built.runs, built.counts.len());
+    let (built, listed, ok) = if clearnet {
+        let (l, built) = list::build_clearnet(&runs, network, rule, version, created, &note)?;
+        (built, Listed { peers: l.peers.len(), version: l.version.clone(), body: pretty(&l)? }, l.check())
+    } else {
+        let (l, built) = list::build(&runs, network, rule, version, created, &note)?;
+        (built, Listed { peers: l.peers.len(), version: l.version.clone(), body: pretty(&l)? }, l.check())
+    };
+    eprintln!("{network}: {} peers from {} runs ({:?}); {} peers passed at least once", listed.peers, built.runs.len(), built.runs, built.counts.len());
     let mut hist: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
     for (_, n) in &built.counts {
         *hist.entry(*n).or_default() += 1;
     }
     eprintln!("passes -> peers: {hist:?}");
-    let body = serde_json::to_string_pretty(&built.list).map_err(|e| e.to_string())? + "\n";
-    Ok((built.list, body))
+    if listed.peers == 0 {
+        return Err(format!("no {network} peer passed every check in {} of the last {} runs; nothing written", rule.min_pass, rule.last));
+    }
+    ok.map_err(|e| format!("the {network} list is not well formed ({e}); nothing written"))?;
+    Ok(listed)
 }
 
 fn list_cmd(a: &Args) -> Result<(), String> {
     let network = a.req("network")?;
     netcfg::by_name(network).ok_or("--network must be mainnet, signet or testnet4")?;
-    let key = keys::SecretKey::load(&PathBuf::from(a.req("key")?))?;
     let rule = list::Rule { last: a.num("last", 7)?, min_pass: a.num("min-pass", 6)? };
-    let (_, body) = signed_list(a, network, &rule, &key)?;
+    let body = make_list(a, network, &rule)?.body;
     match a.get("out") {
         Some(p) => std::fs::write(p, &body).map_err(|e| format!("{p}: {e}"))?,
         None => print!("{body}"),
@@ -188,11 +215,10 @@ fn list_cmd(a: &Args) -> Result<(), String> {
 }
 
 /// One budgeted crawl (unless --no-crawl), then the peers that passed every check in each of
-/// the last `--runs` runs, signed. scripts/install-release.sh puts it in the node module.
+/// the last `--runs` runs. scripts/install-release.sh puts it in the node module.
 async fn release(a: &Args) -> Result<(), String> {
     let network = a.req("network")?;
     netcfg::by_name(network).ok_or("--network must be mainnet, signet or testnet4")?;
-    let key = keys::SecretKey::load(&PathBuf::from(a.req("key")?))?;
     let dir = a.get("out").map(PathBuf::from).unwrap_or_else(|| a.home().join("release"));
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let runs: usize = a.num("runs", 1)?;
@@ -203,39 +229,41 @@ async fn release(a: &Args) -> Result<(), String> {
         let (path, run) = crawl::run(crawl_opts(a)?).await?;
         println!("{}", path.display());
         print_summary(&run);
-        // Interrupted: nothing signed, though `--no-crawl` may still sign from the run kept.
+        // Interrupted: nothing written, though `--no-crawl` may still list from the run kept.
         if run.summary.stopped_early {
-            return Err(format!("the {network} crawl stopped early; nothing signed"));
+            return Err(format!("the {network} crawl stopped early; nothing written"));
         }
     }
-    let (list, body) = signed_list(a, network, &list::Rule { last: runs, min_pass: runs }, &key)?;
-    if list.peers.is_empty() {
-        return Err(format!("no {network} peer passed every check in the last {runs} runs; nothing written"));
-    }
-    let out = dir.join(format!("{network}.json"));
-    std::fs::write(&out, body).map_err(|e| format!("{}: {e}", out.display()))?;
-    println!("{}: {} peers, version {}, key {}", out.display(), list.peers.len(), list.version, key.key_id);
+    let list = make_list(a, network, &list::Rule { last: runs, min_pass: runs })?;
+    let out = dir.join(if a.clearnet() { format!("clearnet-{network}.json") } else { format!("{network}.json") });
+    std::fs::write(&out, list.body).map_err(|e| format!("{}: {e}", out.display()))?;
+    println!("{}: {} peers, version {}", out.display(), list.peers, list.version);
     Ok(())
 }
 
 fn seeds_cmd(a: &Args) -> Result<(), String> {
     let out = PathBuf::from(a.req("out")?);
-    for s in seeds::extract(&PathBuf::from(a.req("core-src")?))? {
-        let path = out.join(format!("seeds-{}.json", s.network));
-        let body = serde_json::to_string_pretty(&s).map_err(|e| e.to_string())? + "\n";
-        std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
-        println!("{}: {} onion seeds ({})", path.display(), s.peers.len(), s.source);
+    let core = PathBuf::from(a.req("core-src")?);
+    for (prefix, all) in [("seeds", seeds::extract(&core)?), ("clearnet-seeds", seeds::extract_clearnet(&core)?)] {
+        for s in all {
+            let path = out.join(format!("{prefix}-{}.json", s.network));
+            let body = serde_json::to_string_pretty(&s).map_err(|e| e.to_string())? + "\n";
+            std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+            println!("{}: {} seeds ({})", path.display(), s.peers.len(), s.source);
+        }
     }
     Ok(())
 }
 
 fn verify_cmd(a: &Args) -> Result<(), String> {
-    let key = keys::PublicKey::load(&PathBuf::from(a.req("pubkey")?))?;
+    if a.pos.is_empty() {
+        return Err("no list given".into());
+    }
     let mut bad = 0;
     for f in &a.pos {
-        let r = std::fs::read(f).map_err(|e| e.to_string()).and_then(|b| serde_json::from_slice::<list::PeerList>(&b).map_err(|e| e.to_string())).and_then(|l| l.verify(&key).map(|_| l));
+        let r = std::fs::read(f).map_err(|e| e.to_string()).and_then(|b| list::verify_any(&b));
         match r {
-            Ok(l) => println!("OK   {f}: {} v{} {} peers, key {}", l.network, l.version, l.peers.len(), key.key_id),
+            Ok(l) => println!("OK   {f}: {l}"),
             Err(e) => {
                 bad += 1;
                 println!("FAIL {f}: {e}");
@@ -248,24 +276,13 @@ fn verify_cmd(a: &Args) -> Result<(), String> {
     Ok(())
 }
 
-fn keygen(a: &Args) -> Result<(), String> {
-    let label = a.get("label").unwrap_or("test");
-    let k = keys::SecretKey::generate(label)?;
-    let secret = PathBuf::from(a.req("secret")?);
-    k.save(&secret, label)?;
-    let public = serde_json::to_string_pretty(&k.public()).map_err(|e| e.to_string())? + "\n";
-    std::fs::write(a.req("pubkey")?, public).map_err(|e| e.to_string())?;
-    println!("{} written; secret at {}", k.key_id, secret.display());
-    Ok(())
-}
-
 async fn headers_cmd(a: &Args) -> Result<(), String> {
     let home = a.home();
     let path = home.join("state").join("mainnet-headers.bin");
     let base: bitcoin::BlockHash = headers::BASE_HASH.parse().map_err(|e| format!("{e}"))?;
     let mut chain = headers::Chain::load(&path, headers::BASE_HEIGHT, base);
     let peers = crawl::previous_peers(&home.join("runs").join("mainnet"), 7);
-    let s = headers::sync(&mut chain, &path, bitcoin::Network::Bitcoin, a.socks()?, &peers).await;
+    let s = headers::sync(&mut chain, &path, bitcoin::Network::Bitcoin, socks::Dialer::Tor(a.socks()?), &peers).await;
     if s.confirmed == 0 {
         return Err(format!("no peer confirmed a tip: {:?}", s.errors));
     }
@@ -292,7 +309,6 @@ async fn main() {
             "seeds" => seeds_cmd(&a),
             "list" => list_cmd(&a),
             "verify" => verify_cmd(&a),
-            "keygen" => keygen(&a),
             "headers" => headers_cmd(&a).await,
             "summary" => {
                 for f in &a.pos {
@@ -335,24 +351,57 @@ mod tests {
             let run = Run { network: "signet".into(), started_unix: t, started: util::rfc3339(t), peers, ..Run::default() };
             std::fs::write(runs.join(format!("{i}.json")), serde_json::to_vec(&run).unwrap()).unwrap();
         }
-        let key = keys::SecretKey::generate("test").unwrap();
-        let secret = home.path().join("test.secret");
-        key.save(&secret, "test").unwrap();
-        let (h, k) = (home.path().to_str().unwrap(), secret.to_str().unwrap());
+        let h = home.path().to_str().unwrap();
         let read = |p: &Path| serde_json::from_slice::<list::PeerList>(&std::fs::read(p).unwrap()).unwrap();
+        let verify = |p: &Path| verify_cmd(&args(&[p.to_str().unwrap()]));
 
-        release(&args(&["--network", "signet", "--key", k, "--home", h, "--no-crawl"])).await.unwrap();
+        release(&args(&["--network", "signet", "--home", h, "--no-crawl"])).await.unwrap();
         let one = read(&home.path().join("release/signet.json"));
         assert_eq!(one.peers, vec![a.clone(), b.clone()], "one run: everything that passed it");
-        one.verify(&key.public()).unwrap();
-        assert!(one.note.contains("TEST key"), "{}", one.note);
+        verify(&home.path().join("release/signet.json")).unwrap();
+        assert_eq!(one.note, "Onion v3 peers serving BIP157 compact filters that passed every check over Tor in 1 of the last 1 runs (handshake only).");
 
         let out = home.path().join("two");
-        release(&args(&["--network", "signet", "--key", k, "--home", h, "--no-crawl", "--runs", "2", "--out", out.to_str().unwrap()])).await.unwrap();
+        release(&args(&["--network", "signet", "--home", h, "--no-crawl", "--runs", "2", "--out", out.to_str().unwrap()])).await.unwrap();
         assert_eq!(read(&out.join("signet.json")).peers, vec![a], "two runs: only the peer that passed both");
 
-        let e = release(&args(&["--network", "signet", "--key", k, "--home", h, "--no-crawl", "--runs", "3"])).await.unwrap_err();
+        let e = release(&args(&["--network", "signet", "--home", h, "--no-crawl", "--runs", "3"])).await.unwrap_err();
         assert!(e.contains("2 signet runs, and the rule needs 3 passes"), "{e}");
-        assert!(release(&args(&["--network", "mainnet", "--key", k, "--home", h, "--no-crawl"])).await.unwrap_err().contains("0 mainnet runs"));
+        assert!(release(&args(&["--network", "mainnet", "--home", h, "--no-crawl"])).await.unwrap_err().contains("0 mainnet runs"));
+
+        // --clearnet reads the clearnet runs and writes the clearnet list beside the onion one.
+        assert!(release(&args(&["--network", "signet", "--home", h, "--no-crawl", "--clearnet"])).await.unwrap_err().contains("0 signet runs"));
+        let clear = home.path().join("runs/signet-clearnet");
+        std::fs::create_dir_all(&clear).unwrap();
+        let peer = PeerResult { addr: "1.2.3.4:38333".into(), passed: true, services: Some("0xc49".into()), ..PeerResult::default() };
+        let run = Run { network: "signet".into(), clearnet: true, started_unix: 1_791_000_000, peers: vec![peer], ..Run::default() };
+        std::fs::write(clear.join("0.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+        release(&args(&["--network", "signet", "--clearnet", "--home", h, "--no-crawl"])).await.unwrap();
+        let l: list::ClearnetList = serde_json::from_slice(&std::fs::read(home.path().join("release/clearnet-signet.json")).unwrap()).unwrap();
+        assert_eq!((l.peers[0].peer.as_str(), l.peers[0].services.as_str()), ("1.2.3.4:38333", "3145"));
+        verify(&home.path().join("release/clearnet-signet.json")).unwrap();
+        assert_eq!(read(&home.path().join("release/signet.json")).peers.len(), 2, "the onion list is untouched");
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_passing_peer_writes_no_list() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path().to_str().unwrap();
+        for (dir, clearnet, addr) in [("signet", false, format!("{}:38333", onion::from_pubkey(&[1; 32]))), ("signet-clearnet", true, "1.2.3.4:38333".into())] {
+            let runs = home.path().join("runs").join(dir);
+            std::fs::create_dir_all(&runs).unwrap();
+            let peer = PeerResult { addr, passed: false, services: Some("0xc49".into()), ..PeerResult::default() };
+            let run = Run { network: "signet".into(), clearnet, started_unix: 1_791_000_000, peers: vec![peer], ..Run::default() };
+            std::fs::write(runs.join("0.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+        }
+        let out = home.path().join("list.json");
+        for extra in [vec![], vec!["--clearnet"]] {
+            let v = [vec!["--network", "signet", "--home", h, "--no-crawl"], extra.clone()].concat();
+            let e = release(&args(&v)).await.unwrap_err();
+            assert_eq!(e, "no signet peer passed every check in 1 of the last 1 runs; nothing written");
+            let v = [vec!["--network", "signet", "--home", h, "--last", "1", "--min-pass", "1", "--out", out.to_str().unwrap()], extra].concat();
+            assert!(list_cmd(&args(&v)).unwrap_err().starts_with("no signet peer passed"));
+        }
+        assert!(!home.path().join("release/signet.json").exists() && !home.path().join("release/clearnet-signet.json").exists() && !out.exists());
     }
 }

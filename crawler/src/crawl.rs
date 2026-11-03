@@ -1,5 +1,6 @@
 //! One run for one network: candidates from the DNS seeds, btcnodes.io, our own node and peers'
-//! addrv2 gossip; checks over Tor with bounded concurrency; the run's JSON file.
+//! addrv2 gossip; checks over Tor with bounded concurrency; the run's JSON file. A clearnet run
+//! (`--clearnet`) checks IPv4 and IPv6 peers instead, every connection direct.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -17,17 +18,19 @@ use tokio::task::JoinSet;
 use crate::headers::{self, Chain};
 use crate::netcfg::NetCfg;
 use crate::onion;
-use crate::p2p::{Conn, X49};
+use crate::p2p::{Conn, PROTOCOL, X49};
 use crate::results::*;
 use crate::rpc::Rpc;
-use crate::socks::{self, Target};
-use crate::util::{isolation, percentiles, rfc3339, stamp, unix_now};
+use crate::socks::{Dialer, Target};
+use crate::util::{percentiles, rfc3339, stamp, unix_now};
 
 const BIT6: u64 = 1 << 6;
 
 pub struct Opts {
     pub net: NetCfg,
     pub socks: SocketAddr,
+    /// IPv4 and IPv6 peers, dialled directly, for the clearnet list.
+    pub clearnet: bool,
     pub state_dir: PathBuf,
     pub runs_dir: PathBuf,
     pub concurrency: usize,
@@ -62,7 +65,7 @@ struct Expect {
 }
 
 struct Ctx {
-    socks: SocketAddr,
+    dialer: Dialer,
     network: Network,
     gossip_min_time: u32,
     connect_timeout: Duration,
@@ -73,7 +76,8 @@ struct Ctx {
 }
 
 struct Checked {
-    onion: bool,
+    /// A candidate for the list, not a peer dialled for its gossip only.
+    listed: bool,
     r: PeerResult,
     /// Onion v3 `host:port` with bit 6, from this peer's addrv2.
     gossip: Vec<String>,
@@ -93,14 +97,14 @@ fn fmt_addr(ip: &IpAddr, port: u16) -> String {
     }
 }
 
-async fn check(ctx: Arc<Ctx>, addr: String, is_onion: bool) -> Checked {
-    let mut out = Checked { onion: is_onion, r: PeerResult { addr: addr.clone(), ..PeerResult::default() }, gossip: vec![], gossip_clear: vec![], gossip_onion: 0 };
+async fn check(ctx: Arc<Ctx>, addr: String, listed: bool) -> Checked {
+    let mut out = Checked { listed, r: PeerResult { addr: addr.clone(), ..PeerResult::default() }, gossip: vec![], gossip_clear: vec![], gossip_onion: 0 };
     let r = &mut out.r;
     let Some((host, port)) = onion::split_host_port(&addr) else {
         r.failure = Some("address: not host:port".into());
         return out;
     };
-    let target = if is_onion {
+    let target = if onion::to_pubkey(host).is_some() {
         Target::Name(host)
     } else {
         match host.parse::<IpAddr>() {
@@ -112,7 +116,7 @@ async fn check(ctx: Arc<Ctx>, addr: String, is_onion: bool) -> Checked {
         }
     };
     let t = Instant::now();
-    let tcp = match tokio::time::timeout(ctx.connect_timeout, socks::connect(ctx.socks, &target, port, &isolation())).await {
+    let tcp = match tokio::time::timeout(ctx.connect_timeout, ctx.dialer.connect(&target, port)).await {
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             r.failure = Some(format!("connect: {e}"));
@@ -143,11 +147,13 @@ async fn check(ctx: Arc<Ctx>, addr: String, is_onion: bool) -> Checked {
     r.services = Some(format!("0x{services:x}"));
     r.user_agent = Some(v.user_agent.chars().take(80).collect());
     r.start_height = Some(v.start_height);
-    r.services_ok = services & X49 == X49;
-    if !r.services_ok {
+    r.services_ok = services & X49 == X49 && v.version >= PROTOCOL;
+    if services & X49 != X49 {
         r.failure = Some("services: missing-bits (needs 0, 3 and 6)".into());
+    } else if v.version < PROTOCOL {
+        r.failure = Some(format!("protocol: below {PROTOCOL}"));
     }
-    if let (true, true, Some(e)) = (is_onion, services & BIT6 != 0, &ctx.expect) {
+    if let (true, true, Some(e)) = (listed, services & BIT6 != 0, &ctx.expect) {
         let t = Instant::now();
         match tokio::time::timeout(ctx.cfheaders_timeout, c.cfheaders(e.start, e.stop, e.count)).await {
             Ok(Ok((prev, last))) => {
@@ -252,7 +258,7 @@ async fn mainnet_reference(o: &Opts, peers: &[String], range: u32, depth: u32, r
     let base: BlockHash = headers::BASE_HASH.parse().map_err(|e| format!("checkpoint: {e}"))?;
     let mut chain = Chain::load(&path, headers::BASE_HEIGHT, base);
     let before = chain.tip_height();
-    let s = headers::sync(&mut chain, &path, o.net.network, o.socks, peers).await;
+    let s = headers::sync(&mut chain, &path, o.net.network, dialer(o), peers).await;
     let tip = chain.tip_height();
     reference.headers_note = Some(format!(
         "headers {before} -> {tip} (+{}) from {} peers, {} at their tip; highest peer start_height {}; errors: {}",
@@ -276,7 +282,7 @@ async fn mainnet_reference(o: &Opts, peers: &[String], range: u32, depth: u32, r
         stop_height: Some(stop_h),
         stop_hash: Some(stop.to_string()),
         headers_note: reference.headers_note.take(),
-        note: "not checked against our own node: filter headers are the majority answer of independent onion peers; block hashes from a proof-of-work-checked header chain from Kyoto's taproot checkpoint".into(),
+        note: format!("not checked against our own node: filter headers are the majority answer of independent {} peers; block hashes from a proof-of-work-checked header chain from Kyoto's taproot checkpoint", if o.clearnet { "clearnet" } else { "onion" }),
         ..Reference::default()
     };
     Ok(Expect { start, stop, count: range, own: None })
@@ -328,20 +334,30 @@ fn failure_kind(f: &str) -> String {
     }
 }
 
+fn dialer(o: &Opts) -> Dialer {
+    if o.clearnet { Dialer::Direct } else { Dialer::Tor(o.socks) }
+}
+
+/// Where a network's runs are kept: clearnet runs apart from onion ones.
+pub fn runs_name(network: &str, clearnet: bool) -> String {
+    if clearnet { format!("{network}-clearnet") } else { network.to_string() }
+}
+
 pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     let started = unix_now();
     let t0 = Instant::now();
-    let run_dir = o.runs_dir.join(o.net.name);
+    let run_dir = o.runs_dir.join(runs_name(o.net.name, o.clearnet));
     std::fs::create_dir_all(&run_dir).map_err(|e| format!("{}: {e}", run_dir.display()))?;
     std::fs::create_dir_all(&o.state_dir).map_err(|e| format!("{}: {e}", o.state_dir.display()))?;
     let mut run = Run {
         format: RUN_FORMAT,
         tool: format!("peer-list {}", env!("CARGO_PKG_VERSION")),
         network: o.net.name.into(),
+        clearnet: o.clearnet,
         started: rfc3339(started),
         started_unix: started,
         config: RunConfig {
-            socks: o.socks.to_string(),
+            socks: dialer(&o).describe(),
             concurrency: o.concurrency,
             connect_timeout_s: o.connect_timeout.as_secs(),
             handshake_timeout_s: o.handshake_timeout.as_secs(),
@@ -372,7 +388,11 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
         add(a.clone(), "previous-runs", &mut order);
     }
 
-    let (seeds, ips) = crate::dns::query_all(o.socks, o.net.seeds, o.seed_queries, Duration::from_secs(60)).await;
+    let (seeds, ips) = if o.clearnet {
+        crate::dns::query_local(o.net.seeds, o.net.port, Duration::from_secs(30)).await
+    } else {
+        crate::dns::query_all(o.socks, o.net.seeds, o.seed_queries, Duration::from_secs(60)).await
+    };
     log(format!("DNS seeds: {} addresses from {} of {} seeds", ips.len(), seeds.iter().filter(|s| s.answers > 0).count(), seeds.len()));
     let mut seed_of: HashMap<IpAddr, Vec<String>> = HashMap::new();
     for s in &seeds {
@@ -383,8 +403,18 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
         }
     }
     run.sources.dns_seeds = seeds;
+    // A clearnet run lists the seeds' addresses; an onion run dials them for gossip only.
+    if o.clearnet {
+        for ip in &ips {
+            let a = fmt_addr(ip, o.net.port);
+            for src in seed_of.get(ip).cloned().unwrap_or_default() {
+                add(a.clone(), &src, &mut order);
+            }
+        }
+    }
 
-    if o.net.network == Network::Bitcoin {
+    // btcnodes.io is asked over Tor only; its onion snapshot is the onion list's.
+    if o.net.network == Network::Bitcoin && !o.clearnet {
         let (res, list) = crate::btcnodes::get(&o.state_dir, o.socks, o.btcnodes, Duration::from_secs(180)).await;
         log(format!("btcnodes: {} onion v3 with bit 6 (requested {}, from cache {}, error {:?})", list.len(), res.requested, res.from_cache, res.error));
         run.sources.btcnodes = Some(res);
@@ -401,22 +431,27 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     };
     if let Some(rpc) = &rpc {
         let mut own = OwnNodeResult::default();
-        match rpc.call("getnodeaddresses", json!([0, "onion"])).await {
-            Ok(Value::Array(v)) => {
-                for e in v {
-                    let (Some(host), Some(port)) = (e["address"].as_str(), e["port"].as_u64()) else { continue };
-                    if onion::to_pubkey(host).is_none() {
-                        continue;
-                    }
-                    own.onion_v3 += 1;
-                    if e["services"].as_u64().unwrap_or(0) & BIT6 != 0 {
-                        own.onion_v3_bit6 += 1;
-                        add(format!("{host}:{port}"), "own-node", &mut order);
+        let kinds: &[&str] = if o.clearnet { &["ipv4", "ipv6"] } else { &["onion"] };
+        for kind in kinds {
+            match rpc.call("getnodeaddresses", json!([0, kind])).await {
+                Ok(Value::Array(v)) => {
+                    for e in v {
+                        let (Some(host), Some(port)) = (e["address"].as_str(), e["port"].as_u64()) else { continue };
+                        let addr = match host.parse::<IpAddr>() {
+                            Ok(ip) if o.clearnet => fmt_addr(&ip, port as u16),
+                            Err(_) if !o.clearnet && onion::to_pubkey(host).is_some() => format!("{host}:{port}"),
+                            _ => continue,
+                        };
+                        own.onion_v3 += 1;
+                        if e["services"].as_u64().unwrap_or(0) & BIT6 != 0 {
+                            own.onion_v3_bit6 += 1;
+                            add(addr, "own-node", &mut order);
+                        }
                     }
                 }
+                Ok(other) => own.error = Some(format!("getnodeaddresses: {other}")),
+                Err(e) => own.error = Some(e),
             }
-            Ok(other) => own.error = Some(format!("getnodeaddresses: {other}")),
-            Err(e) => own.error = Some(e),
         }
         log(format!("own node: {} onion v3, {} with bit 6", own.onion_v3, own.onion_v3_bit6));
         run.sources.own_node = Some(own);
@@ -455,7 +490,7 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     log(format!("reference {:?}: stop {:?} at {:?}", run.reference.kind, run.reference.stop_hash, run.reference.stop_height));
 
     let ctx = Arc::new(Ctx {
-        socks: o.socks,
+        dialer: dialer(&o),
         network: o.net.network,
         gossip_min_time: unix_now().saturating_sub(o.gossip_max_age.as_secs()) as u32,
         connect_timeout: o.connect_timeout,
@@ -466,7 +501,8 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     });
 
     // Gossip-only clearnet peers first: their addrv2 can add onion candidates early.
-    let mut queue: VecDeque<(String, bool)> = ips.iter().map(|ip| (fmt_addr(ip, o.net.port), false)).collect();
+    let gossip_only: Vec<String> = if o.clearnet { vec![] } else { ips.iter().map(|ip| fmt_addr(ip, o.net.port)).collect() };
+    let mut queue: VecDeque<(String, bool)> = gossip_only.into_iter().map(|a| (a, false)).collect();
     let mut seen: HashSet<String> = queue.iter().map(|(a, _)| a.clone()).collect();
     let mut queued = 0usize;
     let mut over = 0usize;
@@ -499,8 +535,8 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
     let mut done = 0usize;
     loop {
         while set.len() < o.concurrency && !stop.load(std::sync::atomic::Ordering::SeqCst) {
-            let Some((addr, is_onion)) = queue.pop_front() else { break };
-            set.spawn(check(ctx.clone(), addr, is_onion));
+            let Some((addr, listed)) = queue.pop_front() else { break };
+            set.spawn(check(ctx.clone(), addr, listed));
         }
         let Some(res) = set.join_next().await else { break };
         let Ok(c) = res else { continue };
@@ -511,7 +547,9 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
             gs.addresses += n;
             gs.onion_v3 += c.gossip_onion;
         }
-        for a in c.gossip {
+        // A clearnet run lists the IP peers gossiped, and ignores onions.
+        let (onions, clear) = if o.clearnet { (vec![], c.gossip_clear) } else { (c.gossip, c.gossip_clear) };
+        for a in onions {
             if gossip_seen.insert(a.clone()) {
                 gs.onion_v3_bit6 += 1;
             }
@@ -528,17 +566,33 @@ pub async fn run(o: Opts) -> Result<(PathBuf, Run), String> {
                 }
             }
         }
-        for a in c.gossip_clear {
-            if clear_queued < o.gossip_clearnet && seen.insert(a.clone()) {
+        for a in clear {
+            if o.clearnet {
+                if gossip_seen.insert(a.clone()) {
+                    gs.onion_v3_bit6 += 1;
+                }
+                sources.entry(a.clone()).or_default().insert("gossip".into());
+                if seen.insert(a.clone()) {
+                    if queued < o.budget && clear_queued < o.gossip_clearnet {
+                        queue.push_back((a, true));
+                        queued += 1;
+                        clear_queued += 1;
+                        gs.new_candidates += 1;
+                    } else {
+                        over += 1;
+                    }
+                }
+            } else if clear_queued < o.gossip_clearnet && seen.insert(a.clone()) {
                 queue.push_back((a, false));
                 clear_queued += 1;
             }
         }
-        if c.onion {
+        if c.listed {
             run.peers.push(c.r);
-            // A Tor that builds no circuits would record a false failure for every peer.
+            // A Tor that builds no circuits, or no network, would record a false failure for every peer.
             if run.peers.len() == 64 && run.peers.iter().all(|p| p.connect_ms.is_none()) {
-                return Err("the first 64 onion peers all failed to connect: Tor is not building circuits; no run file written".into());
+                let why = if o.clearnet { "the network is down" } else { "Tor is not building circuits" };
+                return Err(format!("the first 64 peers all failed to connect: {why}; no run file written"));
             }
         } else {
             let mut r = c.r;

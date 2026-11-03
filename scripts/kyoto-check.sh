@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Kyoto against a signed list: N starts of 8 random peers through Tor's IsolateDestAddr port,
+# Kyoto against a list: N starts of 8 random peers through Tor's IsolateDestAddr port,
 # from a checkpoint BPL_KYOTO_BACK blocks (default 144) below the tip. BPL_KYOTO_RESPONSE_TIMEOUT
 # (seconds) overrides Kyoto's 5 s response timeout, for diagnosis only: the plan keeps the default.
-# Usage: kyoto-check.sh mainnet|signet LIST.json PUBKEY.json [starts, default 10]
+# Usage: kyoto-check.sh mainnet|signet LIST.json [starts, default 10]
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 . "$here/env.sh"
-net=$1 list=$2 pubkey=$3 starts=${4:-10}
+net=$1 list=$2 starts=${3:-10}
 back=${BPL_KYOTO_BACK:-144}
 
-"$BIN_DIR/peer-list" verify --pubkey "$pubkey" "$list"
+"$BIN_DIR/peer-list" verify "$list"
 case $net in
     mainnet)
         # Our proof-of-work-checked header chain, brought to the tip by the listed peers.
